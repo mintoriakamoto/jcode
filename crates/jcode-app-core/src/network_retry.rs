@@ -11,6 +11,61 @@ pub struct NetworkWaitPlan {
     pub listener_summary: String,
 }
 
+/// Cap on consecutive network-classified retries within a single turn.
+///
+/// The provider runtimes already retry each request with their own bounded
+/// budgets; this bounds the outer turn loop, which otherwise retries forever
+/// whenever a failure merely looks network-shaped. A server-side idle timeout
+/// on a healthy local link passes the connectivity probe instantly, so
+/// without this cap the loop resends the full-context request back-to-back
+/// indefinitely.
+pub const MAX_CONSECUTIVE_TURN_RETRIES: u32 = 8;
+
+/// Tracks the streak of network retries in the turn loop. Completed requests
+/// reset the streak via [`TurnRetryBudget::note_progress`], so long agentic
+/// turns with occasional real blips are not starved.
+#[derive(Debug, Default)]
+pub struct TurnRetryBudget {
+    consecutive: u32,
+}
+
+impl TurnRetryBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A request completed; a later interruption starts a fresh streak.
+    pub fn note_progress(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Try to start another retry. Returns false once the streak is spent,
+    /// at which point the caller should surface the underlying error.
+    pub fn try_retry(&mut self) -> bool {
+        if self.consecutive >= MAX_CONSECUTIVE_TURN_RETRIES {
+            return false;
+        }
+        self.consecutive += 1;
+        true
+    }
+
+    pub fn attempt(&self) -> u32 {
+        self.consecutive
+    }
+
+    /// Delay that grows with the streak (2s, 2s, 4s, 8s, ... capped at 60s).
+    /// `wait_until_probably_online` returns immediately when the local link is
+    /// fine, so this is what actually paces retries against a struggling
+    /// server.
+    pub fn backoff_delay(&self) -> Duration {
+        Duration::from_secs(2u64.saturating_pow(self.consecutive.min(6)).min(60))
+    }
+
+    pub async fn backoff(&self) {
+        sleep(self.backoff_delay()).await;
+    }
+}
+
 pub fn classify_network_interruption(error: &(dyn std::error::Error + 'static)) -> Option<String> {
     let mut parts = Vec::new();
     let mut current = Some(error);
@@ -182,6 +237,26 @@ async fn wait_for_command_output(command: &str, args: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_retry_budget_caps_consecutive_retries_and_resets_on_progress() {
+        let mut budget = TurnRetryBudget::new();
+        for _ in 0..MAX_CONSECUTIVE_TURN_RETRIES {
+            assert!(budget.try_retry());
+        }
+        assert!(!budget.try_retry(), "streak must be capped");
+        budget.note_progress();
+        assert!(budget.try_retry(), "progress must reset the streak");
+    }
+
+    #[test]
+    fn turn_retry_backoff_grows_and_caps() {
+        let mut budget = TurnRetryBudget::new();
+        assert!(budget.try_retry());
+        assert_eq!(budget.backoff_delay(), Duration::from_secs(2));
+        while budget.try_retry() {}
+        assert!(budget.backoff_delay() <= Duration::from_secs(60));
+    }
 
     #[test]
     fn classifies_common_network_errors() {

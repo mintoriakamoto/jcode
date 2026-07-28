@@ -34,6 +34,10 @@ impl App {
         let mut redraw_interval = super::run_shell::redraw_timer(redraw_period);
         let mut status_spinner_interval = super::run_shell::status_spinner_interval();
         let mut status_spinner_renderer = super::run_shell::StatusSpinnerRenderer::default();
+        // Bounds the network-shaped retry sites below; each completed request
+        // resets the streak. Without this, a server-side idle timeout on a
+        // healthy local link retries the full-context request forever.
+        let mut network_retry_budget = crate::network_retry::TurnRetryBudget::new();
 
         'turn_loop: loop {
             // Mark the turn as in-flight work: from here until the turn ends,
@@ -202,7 +206,9 @@ impl App {
                         match result {
                             Ok(stream) => break stream,
                             Err(err) => {
-                                if let Some(reason) = crate::network_retry::classify_network_interruption(err.as_ref()) {
+                                if let Some(reason) = crate::network_retry::classify_network_interruption(err.as_ref())
+                                    && network_retry_budget.try_retry()
+                                {
                                     let plan = crate::network_retry::wait_plan();
                                     self.push_display_message(DisplayMessage::system(format!(
                                         "Stream interrupted, likely because {reason}. Waiting to retry: {}.",
@@ -214,9 +220,12 @@ impl App {
                                     status_spinner_renderer.draw_full(self, terminal)?;
                                     super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                                     crate::network_retry::wait_until_probably_online().await;
-                                    self.push_display_message(DisplayMessage::system(
-                                        "Network connectivity looks restored; retrying request.".to_string(),
-                                    ));
+                                    network_retry_budget.backoff().await;
+                                    self.push_display_message(DisplayMessage::system(format!(
+                                        "Network connectivity looks restored; retrying request (attempt {} of {}).",
+                                        network_retry_budget.attempt(),
+                                        crate::network_retry::MAX_CONSECUTIVE_TURN_RETRIES
+                                    )));
                                     continue 'turn_loop;
                                 }
                                 return Err(err);
@@ -742,6 +751,7 @@ impl App {
                                             && !saw_message_end;
                                         if no_partial_output
                                             && let Some(reason) = crate::network_retry::classify_message(&message)
+                                            && network_retry_budget.try_retry()
                                         {
                                             let plan = crate::network_retry::wait_plan();
                                             self.push_display_message(DisplayMessage::system(format!(
@@ -753,9 +763,12 @@ impl App {
                                             };
                                             status_spinner_renderer.draw_full(self, terminal)?;
                                             crate::network_retry::wait_until_probably_online().await;
-                                            self.push_display_message(DisplayMessage::system(
-                                                "Network connectivity looks restored; retrying request.".to_string(),
-                                            ));
+                                            network_retry_budget.backoff().await;
+                                            self.push_display_message(DisplayMessage::system(format!(
+                                                "Network connectivity looks restored; retrying request (attempt {} of {}).",
+                                                network_retry_budget.attempt(),
+                                                crate::network_retry::MAX_CONSECUTIVE_TURN_RETRIES
+                                            )));
                                             continue 'turn_loop;
                                         }
                                         return Err(anyhow::anyhow!("Stream error: {}", message));
@@ -1011,6 +1024,7 @@ impl App {
                                     && !saw_message_end;
                                 if no_partial_output
                                     && let Some(reason) = crate::network_retry::classify_network_interruption(e.as_ref())
+                                    && network_retry_budget.try_retry()
                                 {
                                     let plan = crate::network_retry::wait_plan();
                                     self.push_display_message(DisplayMessage::system(format!(
@@ -1022,9 +1036,12 @@ impl App {
                                     };
                                     status_spinner_renderer.draw_full(self, terminal)?;
                                     crate::network_retry::wait_until_probably_online().await;
-                                    self.push_display_message(DisplayMessage::system(
-                                        "Network connectivity looks restored; retrying request.".to_string(),
-                                    ));
+                                    network_retry_budget.backoff().await;
+                                    self.push_display_message(DisplayMessage::system(format!(
+                                        "Network connectivity looks restored; retrying request (attempt {} of {}).",
+                                        network_retry_budget.attempt(),
+                                        crate::network_retry::MAX_CONSECUTIVE_TURN_RETRIES
+                                    )));
                                     continue 'turn_loop;
                                 }
                                 return Err(e);
@@ -1035,7 +1052,7 @@ impl App {
                                     && current_tool.is_none()
                                     && self.streaming.streaming_text.is_empty()
                                     && !saw_message_end;
-                                if no_partial_output {
+                                if no_partial_output && network_retry_budget.try_retry() {
                                     let plan = crate::network_retry::wait_plan();
                                     self.push_display_message(DisplayMessage::system(format!(
                                         "Stream ended before the model response completed; this may be a network disconnect. Waiting to retry: {}.",
@@ -1046,9 +1063,12 @@ impl App {
                                     };
                                     status_spinner_renderer.draw_full(self, terminal)?;
                                     crate::network_retry::wait_until_probably_online().await;
-                                    self.push_display_message(DisplayMessage::system(
-                                        "Network connectivity looks restored; retrying request.".to_string(),
-                                    ));
+                                    network_retry_budget.backoff().await;
+                                    self.push_display_message(DisplayMessage::system(format!(
+                                        "Network connectivity looks restored; retrying request (attempt {} of {}).",
+                                        network_retry_budget.attempt(),
+                                        crate::network_retry::MAX_CONSECUTIVE_TURN_RETRIES
+                                    )));
                                     continue 'turn_loop;
                                 }
                                 break;
@@ -1057,6 +1077,10 @@ impl App {
                     }
                 }
             }
+
+            // The stream finished without a network retry, so the next
+            // interruption starts a fresh streak.
+            network_retry_budget.note_progress();
 
             // If we interleaved a message, skip post-processing and go straight to new API call
             if interleaved {
