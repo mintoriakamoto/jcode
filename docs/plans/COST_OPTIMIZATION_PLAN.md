@@ -181,4 +181,41 @@ so forks run the 120-min QEMU build weekly.
 
 ### Wasted/duplicate API calls (audit pending)
 
-### Per-request context bloat (audit pending)
+### Per-request context bloat (audited)
+
+Per-request input floor is ~15-17k tokens; **~85-90% of it is tool schemas**.
+The system prompt itself is small (~490 tokens) and correctly cache-split.
+
+- **~13-15k tokens of always-on tool schemas, no lazy loading.** ~28 tools are
+  always registered (`jcode-app-core/src/tool/mod.rs:152-256`) and
+  `definitions()` returns all of them every request (`mod.rs:319`). Four tools
+  (swarm ~14 KB, schedule ~8.7 KB, todo ~7.3 KB, session_search ~5 KB of
+  description+schema source) are ~half the budget, and
+  `ensure_intent_in_schema` adds ~1k tokens across all tools
+  (`jcode-tool-core/src/lib.rs:25`). Cached, so steady-state is the 10%
+  cache-read rate — but it's the whole cache prefix, and a mid-session MCP
+  registration busts it (`turn_execution.rs:425`). Highest-leverage fix:
+  deferred tool schemas, or gate swarm/schedule/gmail/selfdev by session mode.
+- **No stale-tool-result elision.** Old tool outputs ride verbatim until the
+  80% compaction threshold; `emergency_truncate_tool_results` exists but is
+  only reachable after a 413/overflow failure
+  (`jcode-compaction-core/src/lib.rs:543,561`). Age-based downgrade of old
+  bash/grep/read dumps to head+tail stubs is a cheap big win.
+- **`read` has no output cap of its own** — 5,000 lines × 2,000 chars/line
+  (`tool/read.rs:12-13`); the only backstop is the 30%-of-budget guard
+  (`tool/mod.rs:541,645`), which on a 200k window still admits a single 60k
+  token read. Every other tool is sensibly capped (bash 30k chars, webfetch
+  40k, etc.).
+- **Images are clamped for API limits, not tokens** (8000px / 9 MB targets in
+  `jcode-base/src/provider/image_clamp.rs`), never downscaled to the ~1568px
+  useful ceiling, and stay in history verbatim — 20 accumulated screenshots
+  ≈ 25-30k resident tokens.
+- **Instruction files are read uncapped** (`AGENTS.md`, prompt overlay,
+  preferred-tools; `prompt.rs:823,868,911`) — cached, but they define the
+  cache prefix. The swarm deep-effort directive adds ~700 tokens to the
+  *uncached* dynamic block per request at that effort (`prompt.rs:91`).
+- The per-turn dynamic system-reminder is inserted after the last user message
+  (`jcode-message-types/src/lib.rs:507`), capping how much message history can
+  stay cached. Memory injection is well capped (5/turn) — no issue.
+
+### Wasted/duplicate API calls (audit pending)
