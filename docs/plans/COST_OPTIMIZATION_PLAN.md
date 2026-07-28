@@ -179,8 +179,6 @@ the telemetry worker (Cloudflare) is the only unconditionally metered infra.
 **Hygiene:** `freebsd-smoke.yml` weekly cron has no `github.repository` guard,
 so forks run the 120-min QEMU build weekly.
 
-### Wasted/duplicate API calls (audit pending)
-
 ### Per-request context bloat (audited)
 
 Per-request input floor is ~15-17k tokens; **~85-90% of it is tool schemas**.
@@ -218,4 +216,78 @@ The system prompt itself is small (~490 tokens) and correctly cache-split.
   (`jcode-message-types/src/lib.rs:507`), capping how much message history can
   stay cached. Memory injection is well capped (5/turn) — no issue.
 
-### Wasted/duplicate API calls (audit pending)
+### Wasted/duplicate API calls (audited)
+
+**Retry amplification:**
+
+- **Unbounded outer retry stacked on the provider's bounded one — HIGH.**
+  Provider runtimes retry sanely (3 attempts, jittered backoff), but the TUI
+  layer retries with **no attempt counter**
+  (`jcode-tui/src/tui/app/turn.rs:205-221,744-760,1013-1028`) on a very broad
+  error classifier (`jcode-app-core/src/network_retry.rs:56-64` matches bare
+  "timeout"). The only brake checks *local* connectivity, so a server-side
+  idle timeout loops forever at 3 full-context requests per cycle.
+- Retry after partial stream output discards already-billed tokens and
+  replays from the top (`anthropic-runtime/src/lib.rs:1645-1660`,
+  `openai_provider_impl.rs:560-575`) — correct UX, real cost.
+- OpenAI WS→HTTPS fallback resends full input immediately with backoff
+  suppressed (`openai_provider_impl.rs:484-550`).
+
+**Uncapped auto-poke — HIGH.** While any todo is incomplete, a synthetic
+full-context turn is queued at every turn end
+(`jcode-tui/src/tui/app/input.rs:1498+`); only the confidence gate is
+bounded, not the poke itself. The comment at `:1555-1562` documents a live
+incident of an unattended session resending every ~5s.
+
+**Swarm has zero dedup — HIGH.** The only guard against overlapping agents is
+a prompt sentence (`jcode-swarm-core/src/lib.rs:415`). Default 32 live
+workers (cap 1000); a turn ending without `complete_node`/`expand_node` is
+requeued to a fresh agent as a full duplicate execution
+(`swarm-core/src/lib.rs:427-429`), and the 45s stale window vs 10s heartbeat
+risks double-assignment of legitimately-blocked workers
+(`server/swarm.rs:89-90,555-640`).
+
+**Compaction waste beyond the model choice (item 1):** `native_compact` is
+tried first and its result *discarded* if oversized, then a second
+full-context summary call runs (`compaction.rs:1703-1730`); in-flight
+background compactions can be abandoned at the hard threshold after being
+paid for (`:935-960`); model transfer fires yet another
+(`compaction.rs:1753`).
+
+**Consensus rerank doubles every memory rerank** — 2 identical sidecar
+prompts fire concurrently and disagreement surfaces nothing
+(`memory_rerank.rs:286`, `config-types/src/lib.rs:606-610`). Three
+overlapping memory-extraction paths (topic-change, every-12-turns,
+session-end whole-transcript) re-process the same text.
+
+**Cache leaks:** the ephemeral memory tail is appended to the request but not
+persisted, so its cache breakpoint never reuses
+(`turn_streaming_mpsc.rs:186-192`); dynamic system content rides as a
+per-turn-varying message that everything after it re-processes
+(`provider-core/src/lib.rs:96`). Otherwise cache hygiene is deliberately
+good (one-shot git/timestamp message, sorted tool defs).
+
+## Top actions across all audits
+
+Correctness-adjacent cost bugs first (these can burn unbounded money in one
+bad session), then structural savings:
+
+1. **Cap the TUI outer retry loop** (attempt counter + backoff) — unbounded
+   full-context resends today.
+2. **Cap the incomplete-todo auto-poke** — documented live runaway incident.
+3. **Route compaction summaries through the sidecar cheap model** (ranked gap
+   #1) and fix the discard-and-redo / abandon-in-flight paths.
+4. **Defer/gate tool schemas** — ~13-15k tokens on every request; ~half from
+   four tools most sessions never use.
+5. **Elide stale tool results before the 80% cliff** (age-based head+tail
+   stubs) and cap `read` output.
+6. **Bedrock + OpenRouter prompt caching parity** (ranked gaps #2-3) and the
+   trivial `complete()` split fix (#4).
+7. **Swarm dedup + requeue guards** — structural multiplier at 32-way
+   parallelism.
+8. **Telemetry worker**: D1 batching, sampling of per-turn events, rate
+   limiting on the public endpoint — the only traffic-scaling infra cost.
+9. **CI quick wins**: prebuilt tool binaries, drop the duplicate cargo check,
+   paths-ignore for docs; then FreeBSD/macOS/iOS release-pipeline caching.
+10. **Add dollar fields to usage rollups** (ranked gap #7) so 1-9 are
+    verifiable.
