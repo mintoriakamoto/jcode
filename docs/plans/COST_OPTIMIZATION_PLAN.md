@@ -115,5 +115,70 @@ verifying items 1-5.
 
 ## Additional findings (2026-07 deep audit)
 
-_Pending: wasted/duplicate API call audit, per-request context bloat audit,
-release/infra pipeline audit._
+### Infra / CI-CD (audited)
+
+All runners are GitHub-hosted (no `self-hosted` labels anywhere) — if the repo
+is public, Actions minutes are $0 and these are wall-clock/queue-time wins;
+the telemetry worker (Cloudflare) is the only unconditionally metered infra.
+
+**Telemetry worker — the only traffic-scaling cost, and it's unbounded:**
+
+- Every event costs 2-5+ separate D1 statements with no `env.DB.batch()`
+  anywhere (`telemetry-worker/src/worker.js:672,974,1598,1078-1120`) — each a
+  billed statement and a subrequest. Batch them (also makes writes atomic).
+- No sampling on high-volume events: `turn_end` fires per agent turn and takes
+  the full D1 path plus an Analytics Engine write. The AE firehose is already
+  designated the primary store for these (`wrangler.toml:26-33`) — sample the
+  redundant D1 raw tail 1-in-N.
+- `install`/`feedback`/`subscription_activated`/`account_linked` are never
+  pruned, and `daily_active_users` grows one row per user per day forever
+  against D1's hard 500 MB cap (`worker.js:556-564`). Nightly prune is capped
+  at 120k rows/run (`worker.js:583-584`) and can silently fall behind into the
+  emergency half-all-retention path (`worker.js:544`).
+- The public `POST /v1/event` endpoint has `ALLOWED_ORIGIN = "*"`, no auth, no
+  rate limiting (`worker.js:351-470`) — write volume (= cost) is
+  attacker-controlled. Add Cloudflare rate limiting.
+
+**CI (every PR/push):**
+
+- Three `cargo install`s compile from source on every run:
+  `cargo-machete` (`ci.yml:107`), `cargo-audit` (`ci.yml:290`), and
+  `cargo-xwin` from **unpinned git** (`ci.yml:538` — also a supply-chain
+  risk). rust-cache does not cache `~/.cargo/bin`. Swap for
+  `taiki-e/install-action` prebuilt binaries — best effort-to-payoff fix.
+- `quality` runs `cargo check --all-targets --all-features` then clippy with
+  the same flags (`ci.yml:46,49`) — the check step is duplicated work; delete
+  it.
+- `windows-build-test` (150-min timeout, `ci.yml:293-295`) does a release
+  build on every PR and largely duplicates `release.yml:170`; PRs could use
+  check/debug profile.
+- `windows-cross-check` (`ci.yml:508`) overlaps the native Windows job for
+  x64; its unique ARM64 leg is already advisory (`ci.yml:545`). Reduce to the
+  ARM64 check or drop.
+
+**Release pipeline (per tag):**
+
+- FreeBSD builds under QEMU with no cargo cache — cold full release build
+  every tag, 180-min ceiling (`release.yml:414-419`). Largest single
+  minute-consumer; cache into the VM or cross-compile.
+- Two full macOS release builds (aarch64 + intel, `release.yml:80,83`, 10×
+  rate) — ship a universal binary from one runner, or drop Intel.
+- A dedicated `windows-latest` runner boots just to sign artifacts
+  (`release.yml:295-297`) — fold into the build matrix leg.
+- The release Windows leg recompiles the e2e harness that already ran in CI
+  (`release.yml:279-289`) — gate behind `workflow_dispatch`.
+
+**iOS (per `ios/**` push to master):**
+
+- Three sequential macOS jobs (up to 120 macOS-minutes) with zero caching (no
+  SPM/DerivedData/Homebrew cache), `xcodegen` brew-installed twice, and a
+  TestFlight upload burning a build number on every push
+  (`ios-testflight.yml:23,40,67,44,73`). Merge test+compile-check, add
+  caches, gate upload to tags.
+
+**Hygiene:** `freebsd-smoke.yml` weekly cron has no `github.repository` guard,
+so forks run the 120-min QEMU build weekly.
+
+### Wasted/duplicate API calls (audit pending)
+
+### Per-request context bloat (audit pending)
