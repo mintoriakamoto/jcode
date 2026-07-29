@@ -200,11 +200,9 @@ The system prompt itself is small (~490 tokens) and correctly cache-split.
   only reachable after a 413/overflow failure
   (`jcode-compaction-core/src/lib.rs:543,561`). Age-based downgrade of old
   bash/grep/read dumps to head+tail stubs is a cheap big win.
-- **`read` has no output cap of its own** — 5,000 lines × 2,000 chars/line
-  (`tool/read.rs:12-13`); the only backstop is the 30%-of-budget guard
-  (`tool/mod.rs:541,645`), which on a 200k window still admits a single 60k
-  token read. Every other tool is sensibly capped (bash 30k chars, webfetch
-  40k, etc.).
+- ~~**`read` has no output cap of its own**~~ — FIXED. Now capped at ~120k
+  chars total (`tool/read.rs`), with the continuation hint pointing at the
+  first un-emitted line.
 - **Images are clamped for API limits, not tokens** (8000px / 9 MB targets in
   `jcode-base/src/provider/image_clamp.rs`), never downscaled to the ~1568px
   useful ceiling, and stay in history verbatim — 20 accumulated screenshots
@@ -273,11 +271,69 @@ good (one-shot git/timestamp message, sorted tool defs).
 Done on this branch: TUI retry cap (`network_retry::TurnRetryBudget`),
 auto-poke stall disarm, compaction summaries via sidecar cheap model,
 Bedrock cachePoint caching + cache usage reporting, OpenRouter system-prompt
-cache_control, telemetry D1 batching, CI prebuilt tool binaries + duplicate
-check removal + fork cron guard. Invalidated: the `complete()` split fix
-(see gap #4). Remaining: tool-schema deferral, stale-tool-result elision,
-`read` cap, swarm dedup, telemetry sampling/rate-limiting/retention, usage
-dollar fields, release/iOS pipeline caching.
+cache_control, telemetry D1 batching, telemetry endpoint flood guard, `read`
+output cap, CI prebuilt tool binaries + duplicate check removal + fork cron
+guard.
+
+Retracted after verification: see "Findings retracted on verification".
+
+Remaining: tool-schema deferral, stale-tool-result elision, swarm dedup,
+telemetry D1 sampling and retention, release/iOS pipeline caching.
+
+Deliberately NOT done, with reasons:
+
+- **Naive stale-tool-result elision** would rewrite old messages in place,
+  changing the cached prefix on every turn and forcing a full cache re-write.
+  That can cost *more* than the tokens it saves. A correct implementation must
+  elide only at a compaction boundary, so the prefix stays stable between
+  boundaries — worth doing, but it is a design change, not a quick win.
+- **D1 sampling of `turn_end`** would corrupt the `daily_active_users`
+  rollup: `insertEventRow` only runs the rollup when the event row actually
+  inserts (`worker.js`), so sampling the event row silently drops DAU
+  contributions. Sampling must move the rollup outside the sampling gate
+  first.
+- **Retention for the never-pruned tables** (`install`, `feedback`,
+  `subscription_activated`, `account_linked`, `daily_active_users`) is real
+  and still needed, but it deletes historical analytics data. That is the
+  owner's call, not a change to make unilaterally.
+
+## Findings retracted on verification
+
+Several audit findings did not survive a close reading of the code. Acting on
+them would have cost more than it saved, so they are recorded here rather than
+silently dropped.
+
+- **"Consensus rerank doubles every rerank; disagreement wastes both calls."**
+  Wrong. `votes=2, min_agree=2` (`memory_rerank.rs:286`,
+  `config-types/src/lib.rs:606-610`) is a *precision filter*: two independent
+  samples must agree before a memory is surfaced, which suppresses
+  false-positive injections. Disagreement suppressing a memory is the
+  mechanism, not waste. Dropping to one vote would inject more marginal
+  memories into the main prompt — strictly more tokens, not fewer.
+
+- **"Compaction abandons in-flight work after paying for it."** Overstated.
+  `ensure_context_fits` (`compaction.rs:936-975`) explicitly waits up to 15s
+  for an in-flight background compaction to land before hard-compacting, with
+  a comment naming the wasted-work avoidance. It only escalates on timeout,
+  which is the correct trade-off when the next call would otherwise fail.
+
+- **"No aggregate spend tracking."** Weaker than stated. Per-turn and
+  cumulative session cost already exist (`CostState.total_cost`,
+  `misc_ui.rs:232-308`), are restored on resume, and are surfaced in the TUI.
+  Telemetry already ships per-turn input/output/cache token counts, so
+  cross-user cost is computable server-side by joining with
+  `provider-core/src/pricing.rs`. The `DayUsage`/`MonthUsage`/`AllTimeUsage`
+  structs cited in the original finding are **Copilot request counters** for a
+  subscription product that does not bill per token; adding USD fields there
+  would be actively misleading. A persistent cross-session dollar ledger
+  remains a legitimate feature request, but it needs a storage-format decision
+  and must not add file I/O to the per-call hot path.
+
+- **"Non-streaming Anthropic path busts its own system cache."** See gap #4 —
+  invalidated; all main-loop callers use the split path.
+
+Still open and still believed correct: stale-tool-result elision, tool-schema
+deferral, swarm dedup, telemetry sampling/retention, release-pipeline caching.
 
 ## Top actions across all audits
 
