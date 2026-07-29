@@ -342,3 +342,76 @@ async fn read_tool_prefers_end_line_over_limit() {
         output.output
     );
 }
+
+#[tokio::test]
+async fn read_tool_caps_total_output_and_offers_continuation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("huge.txt");
+    // ~400 chars/line * 2000 lines = ~800k chars, well past MAX_TOTAL_CHARS.
+    let line = "x".repeat(400);
+    let content: String = (0..2000).map(|_| format!("{line}\n")).collect();
+    std::fs::write(&path, &content).expect("write sample file");
+
+    let tool = ReadTool::new();
+    let output = tool
+        .execute(
+            json!({ "file_path": "huge.txt" }),
+            make_ctx(temp.path().to_path_buf()),
+        )
+        .await
+        .expect("read execution should succeed");
+
+    assert!(
+        output.output.len() < MAX_TOTAL_CHARS * 2,
+        "capped output should stay near the cap, got {} chars",
+        output.output.len()
+    );
+    assert!(
+        output.output.contains("output capped at"),
+        "output tail={:?}",
+        &output.output[output.output.len().saturating_sub(200)..]
+    );
+    // The continuation hint must point at the first line NOT emitted, so a
+    // follow-up read resumes without gaps or repeats.
+    let hint_line: usize = output
+        .output
+        .rsplit("offset=")
+        .next()
+        .and_then(|rest| rest.split(char::is_whitespace).next())
+        .and_then(|num| num.parse().ok())
+        .expect("continuation hint with offset");
+    let last_emitted: usize = output
+        .output
+        .lines()
+        .filter_map(|l| l.split('\t').next()?.trim().parse::<usize>().ok())
+        .next_back()
+        .expect("at least one numbered line");
+    assert_eq!(
+        hint_line, last_emitted,
+        "0-based next offset must equal the last emitted 1-based line number"
+    );
+}
+
+#[tokio::test]
+async fn read_tool_under_cap_is_unchanged() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("small.txt");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("write sample file");
+
+    let tool = ReadTool::new();
+    let output = tool
+        .execute(
+            json!({ "file_path": "small.txt" }),
+            make_ctx(temp.path().to_path_buf()),
+        )
+        .await
+        .expect("read execution should succeed");
+
+    assert!(output.output.contains("1\talpha"));
+    assert!(output.output.contains("3\tgamma"));
+    assert!(
+        !output.output.contains("more lines"),
+        "a fully-read small file must not advertise continuation: {:?}",
+        output.output
+    );
+}
