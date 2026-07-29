@@ -495,7 +495,67 @@ impl Drop for ProcessGroupKillGuard {
     }
 }
 
+/// Route the command through `rtk rewrite` when [rtk](https://github.com/mintoriakamoto/rtk)
+/// is installed. rtk is a filtering proxy for dev commands: `git status`
+/// becomes `rtk git status`, whose output is compressed 60–90% before it
+/// re-enters the model's context — real savings on every tool call, metered
+/// locally by rtk (`rtk gain`). Without this, oversized output is handled only
+/// by blind truncation at MAX_OUTPUT_LEN, which loses information instead of
+/// summarizing it.
+///
+/// Fail-open by design: rtk absent, disabled, or erroring means the original
+/// command runs untouched. Opt out with `JCODE_RTK=0` (or rtk's own
+/// `RTK_DISABLED=1`, which `rtk rewrite` honours itself).
+fn maybe_rewrite_with_rtk(cmd_str: &str) -> String {
+    // Cache the PATH probe: once per process, not per tool call.
+    static RTK_PATH: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+        let exe = if cfg!(windows) { "rtk.exe" } else { "rtk" };
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(exe))
+                .find(|candidate| candidate.is_file())
+        })
+    });
+
+    let original = cmd_str.to_string();
+
+    if std::env::var_os("JCODE_RTK").is_some_and(|v| v == "0") {
+        return original;
+    }
+    // Already rtk-prefixed (user typed it, or a nested session): don't
+    // double-wrap.
+    if original.trim_start().starts_with("rtk ") {
+        return original;
+    }
+    let Some(rtk) = RTK_PATH.as_ref() else {
+        return original;
+    };
+
+    // `rtk rewrite` is a pure string transform (~3ms): supported commands come
+    // back prefixed (`cargo test && git push` -> `rtk cargo test && rtk git
+    // push`), unsupported ones come back unchanged.
+    let output = std::process::Command::new(rtk)
+        .arg("rewrite")
+        .arg(&original)
+        .stdin(Stdio::null())
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let rewritten = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if rewritten.is_empty() {
+                original
+            } else {
+                rewritten
+            }
+        }
+        _ => original,
+    }
+}
+
 fn build_shell_command(cmd_str: &str) -> TokioCommand {
+    let rewritten = maybe_rewrite_with_rtk(cmd_str);
+    let cmd_str = rewritten.as_str();
     #[cfg(windows)]
     {
         let mut cmd = TokioCommand::new("cmd.exe");
@@ -550,6 +610,46 @@ fn format_command_output(mut output: String, exit_code: Option<i32>) -> String {
         "Command completed successfully (no output)".to_string()
     } else {
         output
+    }
+}
+
+#[cfg(test)]
+mod rtk_rewrite_tests {
+    use super::maybe_rewrite_with_rtk;
+    use std::sync::Mutex;
+
+    /// Env-var mutations race across parallel tests — serialize them.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn disabled_via_env_returns_command_unchanged() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY-adjacent note: set_var is process-global; the lock plus
+        // remove_var below keep this hermetic.
+        unsafe { std::env::set_var("JCODE_RTK", "0") };
+        let out = maybe_rewrite_with_rtk("git status");
+        unsafe { std::env::remove_var("JCODE_RTK") };
+        assert_eq!(out, "git status");
+    }
+
+    #[test]
+    fn already_prefixed_command_is_not_double_wrapped() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        assert_eq!(maybe_rewrite_with_rtk("rtk git status"), "rtk git status");
+        assert_eq!(
+            maybe_rewrite_with_rtk("  rtk cargo test"),
+            "  rtk cargo test"
+        );
+    }
+
+    /// Whatever the environment (rtk installed or not), the helper must return
+    /// a runnable command — never an empty string, never an error.
+    #[test]
+    fn always_returns_a_runnable_command() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let out = maybe_rewrite_with_rtk("echo hello");
+        assert!(!out.trim().is_empty());
+        assert!(out.contains("echo hello") || out.contains("rtk"));
     }
 }
 
