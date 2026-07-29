@@ -708,7 +708,10 @@ mod build_chat_messages_tests {
         assert_eq!(cached[0]["role"], "system");
         assert_eq!(cached[0]["content"][0]["type"], "text");
         assert_eq!(cached[0]["content"][0]["text"], "sys prompt");
-        assert_eq!(cached[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            cached[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
 
         // Strict OpenAI-schema endpoints must keep the plain string form.
         let plain = build_chat_messages(&[], "sys prompt", true, false, false, false);

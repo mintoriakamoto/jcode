@@ -723,7 +723,7 @@ impl BedrockProvider {
                     .role(message.role().clone())
                     .set_content(Some(content))
                     .build()
-                    .unwrap_or_else(|_| message)
+                    .unwrap_or(message)
             })
             .collect()
     }

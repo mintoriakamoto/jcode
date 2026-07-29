@@ -268,6 +268,17 @@ per-turn-varying message that everything after it re-processes
 (`provider-core/src/lib.rs:96`). Otherwise cache hygiene is deliberately
 good (one-shot git/timestamp message, sorted tool defs).
 
+## Implementation status (2026-07)
+
+Done on this branch: TUI retry cap (`network_retry::TurnRetryBudget`),
+auto-poke stall disarm, compaction summaries via sidecar cheap model,
+Bedrock cachePoint caching + cache usage reporting, OpenRouter system-prompt
+cache_control, telemetry D1 batching, CI prebuilt tool binaries + duplicate
+check removal + fork cron guard. Invalidated: the `complete()` split fix
+(see gap #4). Remaining: tool-schema deferral, stale-tool-result elision,
+`read` cap, swarm dedup, telemetry sampling/rate-limiting/retention, usage
+dollar fields, release/iOS pipeline caching.
+
 ## Top actions across all audits
 
 Correctness-adjacent cost bugs first (these can burn unbounded money in one
