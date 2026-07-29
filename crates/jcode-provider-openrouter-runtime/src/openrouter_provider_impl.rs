@@ -91,6 +91,7 @@ impl Provider for OpenRouterProvider {
             allow_reasoning,
             include_reasoning_content,
             allow_image_input,
+            cache_supported,
         );
 
         // Build tools in OpenAI format
