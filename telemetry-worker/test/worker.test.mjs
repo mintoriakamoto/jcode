@@ -64,6 +64,15 @@ function makeDb(plan = {}) {
   const sizeAfter = plan.sizeAfter ?? 1000;
   return {
     executed,
+    // D1 batch: execute the bound statements in order and return their
+    // results. The real API is transactional; the mock just runs them.
+    async batch(stmts) {
+      const results = [];
+      for (const stmt of stmts) {
+        results.push(await stmt.run());
+      }
+      return results;
+    },
     prepare(sql) {
       return {
         bind(...values) {
