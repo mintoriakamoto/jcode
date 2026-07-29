@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import worker from "../src/worker.js";
+import worker, { __resetRateLimitState } from "../src/worker.js";
 
 const EVENT_URL = "https://telemetry.example/v1/event";
 const HEALTH_URL = "https://telemetry.example/v1/health";
@@ -906,4 +906,75 @@ test("POST responses from the beacon origin carry CORS headers", async () => {
   const response = await worker.fetch(request, { DB: db }, makeCtx());
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("Access-Control-Allow-Origin"), "https://jcode.sh");
+});
+
+test("sustained normal traffic is never rate limited", async () => {
+  __resetRateLimitState();
+  // Far above a real client's rate (a busy 10-session user emits tens of
+  // events per minute, not hundreds) yet comfortably under the guard:
+  // legitimate use must never be rejected.
+  for (let i = 0; i < 200; i++) {
+    const response = await worker.fetch(
+      postRequest(makeBody({ id: "steady-user" })),
+      { DB: makeDb(), FIREHOSE: makeFirehose() },
+      makeCtx(),
+    );
+    assert.equal(response.status, 200, `request ${i} should be accepted`);
+  }
+});
+
+test("a flooding id is rate limited without affecting other ids", async () => {
+  __resetRateLimitState();
+  let rejected = 0;
+  for (let i = 0; i < 700; i++) {
+    const response = await worker.fetch(
+      postRequest(makeBody({ id: "flooder" })),
+      { DB: makeDb(), FIREHOSE: makeFirehose() },
+      makeCtx(),
+    );
+    if (response.status === 429) {
+      rejected += 1;
+    }
+  }
+  assert.ok(rejected > 0, "a sustained flood should eventually be limited");
+
+  // A different id must be entirely unaffected by the flooder.
+  const bystander = await worker.fetch(
+    postRequest(makeBody({ id: "bystander" })),
+    { DB: makeDb(), FIREHOSE: makeFirehose() },
+    makeCtx(),
+  );
+  assert.equal(bystander.status, 200);
+});
+
+test("rate limited requests perform no billable writes", async () => {
+  __resetRateLimitState();
+  for (let i = 0; i < 601; i++) {
+    await worker.fetch(
+      postRequest(makeBody({ id: "noisy" })),
+      { DB: makeDb(), FIREHOSE: makeFirehose() },
+      makeCtx(),
+    );
+  }
+  const db = makeDb();
+  const firehose = makeFirehose();
+  const response = await worker.fetch(
+    postRequest(makeBody({ id: "noisy" })),
+    { DB: db, FIREHOSE: firehose },
+    makeCtx(),
+  );
+  assert.equal(response.status, 429);
+  assert.equal(db.executed.length, 0, "429 must not touch D1");
+  assert.equal(firehose.points.length, 0, "429 must not write an AE datapoint");
+});
+
+test("an unparseable id falls open rather than dropping telemetry", async () => {
+  __resetRateLimitState();
+  const response = await worker.fetch(
+    postRequest(makeBody({ id: "" })),
+    { DB: makeDb(), FIREHOSE: makeFirehose() },
+    makeCtx(),
+  );
+  // Empty id is rejected by the required-field check, not by the guard.
+  assert.equal(response.status, 400);
 });

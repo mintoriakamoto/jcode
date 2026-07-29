@@ -82,6 +82,68 @@ let lastObservedDbSizeBytes = 0;
 let lastEmergencyPruneAtMs = 0;
 
 // ---------------------------------------------------------------------------
+// Flood guard for the public POST /v1/event endpoint.
+//
+// The endpoint is anonymous and unauthenticated by design, so write volume —
+// and therefore D1 row cost plus Analytics Engine datapoint cost — is
+// controlled by whoever is sending. This is a per-isolate, best-effort
+// counter: it stops a single runaway or naive flooding client, but a
+// determined attacker rotating `id` values (or spread across isolates) is NOT
+// stopped by it. Cloudflare edge Rate Limiting rules on the route, keyed by
+// IP, remain the real control; see docs/plans/COST_OPTIMIZATION_PLAN.md.
+//
+// The ceiling is deliberately ~10x above any plausible real client: a busy
+// user running 10 concurrent sessions emits on the order of tens of events
+// per minute, not hundreds. Anything that trips this is not normal use. Every
+// failure path here falls open (event is accepted), because dropping real
+// telemetry is worse than admitting an occasional excess event.
+// ---------------------------------------------------------------------------
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_EVENTS_PER_ID = 600;
+const RATE_LIMIT_MAX_TRACKED_IDS = 10_000;
+const rateLimitBuckets = new Map();
+
+// Exported for tests; resets the per-isolate counters.
+export function __resetRateLimitState() {
+  rateLimitBuckets.clear();
+}
+
+function rateLimitExceeded(id) {
+  try {
+    if (typeof id !== "string" || id.length === 0) {
+      return false;
+    }
+    const now = Date.now();
+    const bucket = rateLimitBuckets.get(id);
+    if (bucket && now - bucket.windowStart < RATE_LIMIT_WINDOW_MS) {
+      bucket.count += 1;
+      return bucket.count > RATE_LIMIT_MAX_EVENTS_PER_ID;
+    }
+    // New id, or its window elapsed. Re-inserting moves it to the end of the
+    // Map's insertion order, so eviction below drops the least recently
+    // started windows first.
+    rateLimitBuckets.delete(id);
+    rateLimitBuckets.set(id, { windowStart: now, count: 1 });
+    if (rateLimitBuckets.size > RATE_LIMIT_MAX_TRACKED_IDS) {
+      const excess = rateLimitBuckets.size - RATE_LIMIT_MAX_TRACKED_IDS;
+      let evicted = 0;
+      for (const key of rateLimitBuckets.keys()) {
+        if (evicted >= excess) {
+          break;
+        }
+        rateLimitBuckets.delete(key);
+        evicted += 1;
+      }
+    }
+    return false;
+  } catch (err) {
+    // Fail open: never let the guard itself reject real telemetry.
+    console.warn("rate limit check failed", err?.message || err);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Workers Analytics Engine firehose.
 //
 // Every event is written to the FIREHOSE dataset before the D1 insert. AE is
@@ -425,6 +487,13 @@ export default {
 
     if (!KNOWN_EVENTS.includes(body.event)) {
       return jsonResponse({ error: "Unknown event type" }, 400, cors);
+    }
+
+    // Guard the billable writes (Analytics Engine datapoint + D1 rows) that
+    // follow. Placed after validation so malformed input keeps its existing
+    // 400 semantics.
+    if (rateLimitExceeded(body.id)) {
+      return jsonResponse({ error: "Rate limit exceeded" }, 429, cors);
     }
 
     if (SUBSCRIPTION_EVENTS.includes(body.event)) {
