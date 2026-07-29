@@ -59,14 +59,15 @@ can't attach to it; the code only forwards pre-existing breakpoints
 **Fix**: for Anthropic models routed via OpenRouter, serialize system as
 content blocks and set breakpoints like the native provider.
 
-### 4. Non-streaming Anthropic path busts its own system cache — MED, trivial effort
+### 4. ~~Non-streaming Anthropic path busts its own system cache~~ — INVALIDATED
 
-`Provider::complete()` caches the entire system prompt as one block, dynamic
-parts included (`crates/jcode-provider-anthropic-runtime/src/lib.rs:1034` →
-`build_system_param`), so date/git-status churn invalidates it. The streaming
-path (`:1395`) already uses the correct `build_system_param_split`.
-
-**Fix**: use the split builder on the `complete()` path too.
+On verification: every main-loop caller uses `complete_split`
+(`jcode-tui/src/tui/app/turn.rs:121`, `jcode-app-core/src/agent/turn_loops.rs:117`,
+`turn_streaming_mpsc.rs:230`), and the Provider-trait default `complete_split`
+moves the dynamic part into a message before delegating
+(`jcode-provider-core/src/lib.rs:97`). The unified `complete()` path is only
+reached by aux callers (doctor probes, `complete_simple`) whose system prompts
+are fully static — caching the whole block there is correct. No change needed.
 
 ### 5. No model tiering for subagents or ambient subtasks — MED-HIGH, medium effort
 
