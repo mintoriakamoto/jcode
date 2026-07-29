@@ -932,6 +932,14 @@ pub struct App {
     /// has sent. Without a budget, a model that stops updating its todos gets
     /// nudged on every turn forever, silently burning an API call per tick.
     todo_completion_gate_attempts: u8,
+    /// Fingerprint of the incomplete-todo set the last auto-poke fired for.
+    /// Used with `auto_poke_stalled_pokes` to stop poking a session whose
+    /// todos are no longer changing: unlike the completion gate, the plain
+    /// incomplete-todo poke had no budget at all, so a stalled unattended
+    /// session queued a full-context continuation on every turn end forever.
+    auto_poke_last_fingerprint: Option<u64>,
+    /// Consecutive auto-pokes that saw an unchanged incomplete-todo set.
+    auto_poke_stalled_pokes: u8,
     /// Set when the current turn ended with a provider guardrail/refusal stop
     /// (ServerEvent::ProviderGuardrail). Consumed by the Done handler to
     /// update `consecutive_guardrail_stops`.
@@ -1651,6 +1659,11 @@ impl App {
     /// full API call per nudge. The counter resets whenever a nudge actually
     /// changes the stored todos (progress) or auto-poke is re-armed.
     const TODO_COMPLETION_GATE_MAX_ATTEMPTS: u8 = 5;
+    /// Consecutive incomplete-todo auto-pokes tolerated while the todo set
+    /// stays identical. Progress (any change to the incomplete set) resets
+    /// the streak; exhaustion disarms auto-poke instead of re-sending the
+    /// same full-context continuation every turn end indefinitely.
+    const AUTO_POKE_MAX_STALLED_POKES: u8 = 5;
     /// Consecutive guardrail/refusal-stopped turns tolerated before automatic
     /// continuation paths (auto-poke, overnight poke) are stopped. Guardrail
     /// refusals are deterministic for the same request, so re-poking the same
