@@ -43,6 +43,13 @@ irm https://jcode.sh/install.ps1 | iex
 Need Homebrew, source builds, provider setup, or want an agent to set it up for you?
 [Jump to detailed installation](#detailed-installation).
 
+> **Part of [Cook Labs](https://github.com/mintoriakamoto/portal-scaffold-).**
+> This fork ships with the Cook Labs Token Saver built in: shell commands are
+> auto-routed through the [rtk](https://github.com/mintoriakamoto/rtk) engine
+> when installed (opt out with `JCODE_RTK=0`), and `/tokensaverstats` +
+> `/cooklabs` show your savings in-agent. Accounts, credits, and billing live
+> in the Cook Labs hub repo — jcode itself stays a standalone agent.
+
 ---
 
 
