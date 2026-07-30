@@ -1587,7 +1587,7 @@ pub struct App {
     usage_report_refreshing: bool,
     /// Whether a `/productivity` report generation is currently in flight.
     productivity_refreshing: bool,
-    /// Whether a `/tokensaverstats` or `/tokensaver` rtk invocation is in flight.
+    /// Whether a `/tokensaverstats` or `/tokensaver` background task is in flight.
     tokensaver_command_running: bool,
     /// Last time the passive overnight progress card polled its run files.
     last_overnight_card_refresh: Option<Instant>,

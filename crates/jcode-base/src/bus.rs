@@ -314,10 +314,11 @@ pub struct ProductivityReportPayload {
     pub png_path: std::path::PathBuf,
 }
 
-/// Result of a `/tokensaverstats` or `/tokensaver` rtk invocation.
+/// Result of a `/tokensaverstats` rtk invocation or a `/tokensaver` portal
+/// activation.
 ///
 /// Carries already-formatted text so the TUI layer can display it without
-/// re-running the rtk CLI on the UI thread.
+/// redoing the work on the UI thread.
 #[derive(Clone, Debug)]
 pub struct TokensaverCommandCompleted {
     pub session_id: String,
@@ -468,7 +469,7 @@ pub enum BusEvent {
     MermaidRenderCompleted,
     /// Productivity report finished generating off the UI thread
     ProductivityReportReady(ProductivityReportReady),
-    /// `/tokensaverstats` or `/tokensaver` rtk invocation finished off the UI thread
+    /// `/tokensaverstats` (rtk) or `/tokensaver` (portal HTTP) finished off the UI thread
     TokensaverCommandCompleted(TokensaverCommandCompleted),
 }
 

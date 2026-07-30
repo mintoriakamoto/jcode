@@ -2,14 +2,18 @@
 //! savings measured by the `rtk` CLI and activate portal sync.
 //!
 //! `/tokensaverstats` runs `rtk gain` (plus `rtk gain --history`) and renders
-//! the result as a "Token Saver" block. `/tokensaver <key>` stores
-//! portal credentials via `rtk portal login` and confirms them with
-//! `rtk portal sync --dry-run`. The rtk invocations run off the UI thread;
-//! results are delivered back via [`BusEvent::TokensaverCommandCompleted`].
+//! the result as a "Token Saver" block. `/tokensaver <key>` verifies the key
+//! against the portal's `POST /api/v1/activate` endpoint over HTTP and, on
+//! success, stores `~/.config/tokensaver/credentials.json` (mode 0600, the
+//! same file the portal's own tooling reads) — activation does not need the
+//! rtk CLI at all; only the stats command does. Both the rtk invocation and
+//! the HTTP call run off the UI thread; results are delivered back via
+//! [`BusEvent::TokensaverCommandCompleted`].
 
 use super::*;
 use crate::bus::{Bus, BusEvent, TokensaverCommandCompleted, TokensaverCommandPayload};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -19,6 +23,10 @@ const DEFAULT_PORTAL_URL: &str = "https://portal.tokensaver.dev";
 /// Hard cap on each rtk subprocess so a wedged binary never strands the
 /// in-flight flag.
 const RTK_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard cap on the portal activation HTTP round-trip, mirroring the rtk
+/// subprocess timeout discipline.
+const PORTAL_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Handle `/tokensaverstats`: show how much Token Saver (via rtk) saved.
 pub(super) fn handle_tokensaverstats_command(app: &mut App, trimmed: &str) -> bool {
@@ -153,15 +161,16 @@ fn tokensaver_usage() -> &'static str {
 }
 
 /// Friendly install pointer shown instead of an error when `rtk` is not on
-/// PATH.
+/// PATH. Only `/tokensaverstats` needs rtk; activation talks to the portal
+/// directly over HTTP.
 fn rtk_missing_message() -> String {
-    "Token Saver needs the rtk CLI, which is not installed yet.\n\
+    "Token Saver stats need the rtk CLI, which is not installed yet.\n\
      \n\
      Install it with:\n\
      \n\
      curl -fsSL https://raw.githubusercontent.com/mintoriakamoto/rtk/refs/heads/master/install.sh | sh\n\
      \n\
-     Then run the command again."
+     Then run /tokensaverstats again."
         .to_string()
 }
 
@@ -312,56 +321,147 @@ fn run_tokensaverstats() -> Result<TokensaverCommandPayload, String> {
     })
 }
 
-/// Off-thread body of `/tokensaver <key>`.
-fn run_tokensaver_activation(key: &str) -> Result<TokensaverCommandPayload, String> {
-    let portal_url =
-        std::env::var("TOKENSAVER_PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
+/// Resolve the portal base URL from an optional `TOKENSAVER_PORTAL_URL`
+/// override, falling back to [`DEFAULT_PORTAL_URL`]. Blank overrides are
+/// ignored so `TOKENSAVER_PORTAL_URL=""` doesn't break activation.
+fn portal_url_from(env_override: Option<String>) -> String {
+    env_override
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_PORTAL_URL.to_string())
+}
 
-    let login = match run_rtk(&["portal", "login", "--url", &portal_url, "--token", key]) {
-        Ok(output) => output,
-        Err(RtkError::NotFound) => {
-            return Ok(TokensaverCommandPayload {
-                message: rtk_missing_message(),
-                notice: "rtk not installed".to_string(),
-            });
-        }
-        Err(RtkError::Failed(message)) => return Err(scrub_secret(&message, key)),
-    };
+/// Build the activation endpoint URL, tolerating a trailing slash on the
+/// configured portal base URL.
+fn activate_endpoint(portal_url: &str) -> String {
+    format!("{}/api/v1/activate", portal_url.trim_end_matches('/'))
+}
 
-    if !login.success {
-        let detail = if login.stderr.trim().is_empty() {
-            login.stdout
-        } else {
-            login.stderr
-        };
-        return Err(scrub_secret(
-            &format!("Token Saver login failed: {}", detail.trim()),
-            key,
-        ));
+/// Where device credentials live: `$XDG_CONFIG_HOME/tokensaver/credentials.json`
+/// (or `~/.config/...`). This file is shared with the portal's own tooling
+/// (tokensaver-mcp), so path and JSON shape must match it exactly.
+fn credentials_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"));
+    base.join("tokensaver").join("credentials.json")
+}
+
+/// On-disk credential shape shared with tokensaver-mcp:
+/// `{"portal_url": "...", "device_token": "..."}`.
+#[derive(serde::Serialize)]
+struct Credentials<'a> {
+    portal_url: &'a str,
+    device_token: &'a str,
+}
+
+/// Persist credentials with owner-only permissions: parent directories are
+/// created as needed and the file is forced to mode 0600 on create *and* on
+/// every rewrite, in case a previous process loosened it.
+fn write_credentials(path: &Path, portal_url: &str, device_token: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let creds = Credentials {
+        portal_url,
+        device_token,
+    };
+    let json = serde_json::to_string_pretty(&creds).map_err(std::io::Error::other)?;
+    std::fs::write(path, format!("{json}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
 
-    let sync = run_rtk(&["portal", "sync", "--dry-run"]).map_err(|error| match error {
-        // rtk vanished between the two calls; treat as a plain failure.
-        RtkError::NotFound => "rtk disappeared from PATH during activation".to_string(),
-        RtkError::Failed(message) => scrub_secret(&message, key),
+/// Pure mapping from the activate endpoint's HTTP status + body to either a
+/// greeting (success) or an error message (failure). Kept free of any HTTP
+/// client types so it is unit-testable without touching the network.
+fn interpret_activate_response(status: u16, body: &str) -> Result<String, String> {
+    let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    if (200..300).contains(&status) {
+        let greeting = json
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(|message| message.as_str())
+            .unwrap_or("Token Saver activated — run /tokensaverstats to watch it work.");
+        return Ok(greeting.to_string());
+    }
+    let detail = json
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                format!("HTTP {status}")
+            } else {
+                trimmed.to_string()
+            }
+        });
+    Err(match status {
+        // 401: unknown/revoked key; 402: prepaid balance exhausted. The
+        // portal's error strings already tell the user what to do.
+        401 | 402 => detail,
+        _ => format!("portal returned HTTP {status}: {detail}"),
+    })
+}
+
+/// POST the key to the portal activate endpoint as a bearer token. Returns
+/// `(status, body)`; transport-level failures come back as `Err(message)`.
+fn post_activate(portal_url: &str, key: &str) -> Result<(u16, String), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(PORTAL_HTTP_TIMEOUT)
+        .user_agent("jcode-tokensaver")
+        .build()
+        .map_err(|error| format!("Failed to build HTTP client: {error}"))?;
+    let response = client
+        .post(activate_endpoint(portal_url))
+        .bearer_auth(key)
+        .send()
+        .map_err(|error| {
+            format!("Could not reach the Token Saver portal at {portal_url}: {error}")
+        })?;
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_default();
+    Ok((status, body))
+}
+
+/// Off-thread body of `/tokensaver <key>`: verify the key against the portal
+/// over HTTP, then persist credentials. Verification comes first so a
+/// rejected key (401/402) or unreachable portal never gets written to disk.
+fn run_tokensaver_activation(key: &str) -> Result<TokensaverCommandPayload, String> {
+    let portal_url = portal_url_from(std::env::var("TOKENSAVER_PORTAL_URL").ok());
+
+    let (status, body) =
+        post_activate(&portal_url, key).map_err(|error| scrub_secret(&error, key))?;
+
+    let greeting = interpret_activate_response(status, &body)
+        .map_err(|error| scrub_secret(&format!("Token Saver activation failed: {error}"), key))?;
+
+    let path = credentials_path();
+    write_credentials(&path, &portal_url, key).map_err(|error| {
+        scrub_secret(
+            &format!(
+                "Key verified, but storing credentials in {} failed: {error}",
+                path.display()
+            ),
+            key,
+        )
     })?;
 
-    if !sync.success {
-        let detail = if sync.stderr.trim().is_empty() {
-            sync.stdout
-        } else {
-            sync.stderr
-        };
-        return Err(scrub_secret(
-            &format!("Token Saver sync check failed: {}", detail.trim()),
-            key,
-        ));
-    }
-
     Ok(TokensaverCommandPayload {
-        message: format!(
-            "Token Saver activated (key {}) — run /tokensaverstats to see your savings.",
-            mask_key(key)
+        message: scrub_secret(
+            &format!(
+                "{greeting}\n\nKey {} stored in {}.",
+                mask_key(key),
+                path.display()
+            ),
+            key,
         ),
         notice: "Token Saver activated".to_string(),
     })
@@ -445,5 +545,118 @@ mod tests {
         assert!(block.starts_with("Token Saver\n"));
         assert!(block.contains("No savings recorded yet"));
         assert!(!block.contains("Recent history"));
+    }
+
+    #[test]
+    fn portal_url_from_prefers_override_and_falls_back() {
+        assert_eq!(
+            portal_url_from(Some("https://example.test".to_string())),
+            "https://example.test"
+        );
+        assert_eq!(
+            portal_url_from(Some("  https://example.test  ".to_string())),
+            "https://example.test"
+        );
+        assert_eq!(portal_url_from(None), DEFAULT_PORTAL_URL);
+        // Blank overrides are ignored, not honored as an empty base URL.
+        assert_eq!(portal_url_from(Some(String::new())), DEFAULT_PORTAL_URL);
+        assert_eq!(portal_url_from(Some("   ".to_string())), DEFAULT_PORTAL_URL);
+    }
+
+    #[test]
+    fn activate_endpoint_tolerates_trailing_slash() {
+        assert_eq!(
+            activate_endpoint("https://portal.tokensaver.dev"),
+            "https://portal.tokensaver.dev/api/v1/activate"
+        );
+        assert_eq!(
+            activate_endpoint("https://portal.tokensaver.dev/"),
+            "https://portal.tokensaver.dev/api/v1/activate"
+        );
+    }
+
+    #[test]
+    fn write_credentials_matches_shared_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Parent dirs are created on demand, like tokensaver-mcp does.
+        let path = dir.path().join("nested").join("credentials.json");
+        write_credentials(&path, "https://portal.tokensaver.dev", "cook-1234-abcd")
+            .expect("write credentials");
+
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert!(raw.ends_with('\n'), "file ends with a newline");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "portal_url": "https://portal.tokensaver.dev",
+                "device_token": "cook-1234-abcd",
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_credentials_enforces_0600_on_create_and_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("credentials.json");
+
+        write_credentials(&path, "https://portal.tokensaver.dev", "first-key")
+            .expect("initial write");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "created with 0600");
+
+        // Loosen it, then rewrite: permissions must snap back to 0600.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        write_credentials(&path, "https://portal.tokensaver.dev", "second-key").expect("rewrite");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "rewrite restores 0600");
+
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert!(raw.contains("second-key"), "rewrite replaced the token");
+    }
+
+    #[test]
+    fn interpret_activate_response_success_uses_portal_greeting() {
+        let body = r#"{"ok":true,"activated":true,"first_activation":true,
+            "org":"Acme","device":"laptop","plan":"pro","share_pct":20,
+            "message":"Token Saver activated for Acme — you pay 20% of what we save you. Run /tokensaverstats to watch it work."}"#;
+        let greeting = interpret_activate_response(200, body).expect("success");
+        assert!(greeting.contains("Token Saver activated for Acme"));
+    }
+
+    #[test]
+    fn interpret_activate_response_success_without_message_field() {
+        let greeting = interpret_activate_response(200, r#"{"ok":true}"#).expect("success");
+        assert!(greeting.contains("Token Saver activated"));
+    }
+
+    #[test]
+    fn interpret_activate_response_surfaces_portal_errors() {
+        let unauthorized = interpret_activate_response(
+            401,
+            r#"{"error":"Unknown or revoked key. Create one on the portal Settings page."}"#,
+        )
+        .expect_err("401 fails");
+        assert!(unauthorized.contains("Unknown or revoked key"));
+
+        let no_credits = interpret_activate_response(402, r#"{"error":"Out of credits."}"#)
+            .expect_err("402 fails");
+        assert_eq!(no_credits, "Out of credits.");
+
+        let opaque = interpret_activate_response(500, "boom").expect_err("500 fails");
+        assert!(opaque.contains("HTTP 500"));
+        assert!(opaque.contains("boom"));
+
+        let empty = interpret_activate_response(503, "").expect_err("503 fails");
+        assert!(empty.contains("HTTP 503"));
     }
 }
