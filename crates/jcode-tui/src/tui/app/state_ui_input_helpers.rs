@@ -148,11 +148,11 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/wrapped", "Alias for /productivity"),
     RegisteredCommand::public(
         "/tokensaverstats",
-        "Show Cook Labs (rtk) token savings for this machine",
+        "Show Token Saver (rtk) token savings for this machine",
     ),
     RegisteredCommand::public(
-        "/cooklabs",
-        "Activate Cook Labs savings sync with a portal key",
+        "/tokensaver",
+        "Activate Token Saver savings sync with a portal key",
     ),
     RegisteredCommand::public("/feedback", "Send feedback about jcode"),
     RegisteredCommand::public("/telemetry", "Show or change what jcode sends"),

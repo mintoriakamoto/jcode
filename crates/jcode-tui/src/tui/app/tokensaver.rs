@@ -1,66 +1,66 @@
-//! `/tokensaverstats` and `/cooklabs` commands: surface Cook Labs token
+//! `/tokensaverstats` and `/tokensaver` commands: surface Token Saver token
 //! savings measured by the `rtk` CLI and activate portal sync.
 //!
 //! `/tokensaverstats` runs `rtk gain` (plus `rtk gain --history`) and renders
-//! the result as a "Cook Labs Token Saver" block. `/cooklabs <key>` stores
+//! the result as a "Token Saver" block. `/tokensaver <key>` stores
 //! portal credentials via `rtk portal login` and confirms them with
 //! `rtk portal sync --dry-run`. The rtk invocations run off the UI thread;
-//! results are delivered back via [`BusEvent::CookLabsCommandCompleted`].
+//! results are delivered back via [`BusEvent::TokensaverCommandCompleted`].
 
 use super::*;
-use crate::bus::{Bus, BusEvent, CookLabsCommandCompleted, CookLabsCommandPayload};
+use crate::bus::{Bus, BusEvent, TokensaverCommandCompleted, TokensaverCommandPayload};
 use std::io::Read;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-/// Default Cook Labs portal URL; overridable with `COOKLABS_PORTAL_URL`.
-const DEFAULT_PORTAL_URL: &str = "https://portal.cooklabs.dev";
+/// Default Token Saver portal URL; overridable with `TOKENSAVER_PORTAL_URL`.
+const DEFAULT_PORTAL_URL: &str = "https://portal.tokensaver.dev";
 
 /// Hard cap on each rtk subprocess so a wedged binary never strands the
 /// in-flight flag.
 const RTK_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Handle `/tokensaverstats`: show how much Cook Labs (via rtk) saved.
+/// Handle `/tokensaverstats`: show how much Token Saver (via rtk) saved.
 pub(super) fn handle_tokensaverstats_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed != "/tokensaverstats" {
         return false;
     }
 
-    if app.cooklabs_command_running {
-        app.set_status_notice("Cook Labs command already running…");
+    if app.tokensaver_command_running {
+        app.set_status_notice("Token Saver command already running…");
         return true;
     }
-    app.cooklabs_command_running = true;
+    app.tokensaver_command_running = true;
 
     app.push_display_message(DisplayMessage::system(
-        "Fetching your Cook Labs token savings…".to_string(),
+        "Fetching your Token Saver token savings…".to_string(),
     ));
-    app.set_status_notice("Cook Labs → fetching savings");
+    app.set_status_notice("Token Saver → fetching savings");
 
     let session_id = app.session.id.clone();
     std::thread::spawn(move || {
         let result = run_tokensaverstats();
-        Bus::global().publish(BusEvent::CookLabsCommandCompleted(
-            CookLabsCommandCompleted { session_id, result },
+        Bus::global().publish(BusEvent::TokensaverCommandCompleted(
+            TokensaverCommandCompleted { session_id, result },
         ));
     });
 
     true
 }
 
-/// Handle `/cooklabs [activate] <key>`: activate Cook Labs savings sync.
-pub(super) fn handle_cooklabs_command(app: &mut App, trimmed: &str) -> bool {
-    let rest = if trimmed == "/cooklabs" {
+/// Handle `/tokensaver [activate] <key>`: activate Token Saver savings sync.
+pub(super) fn handle_tokensaver_command(app: &mut App, trimmed: &str) -> bool {
+    let rest = if trimmed == "/tokensaver" {
         ""
-    } else if let Some(rest) = trimmed.strip_prefix("/cooklabs ") {
+    } else if let Some(rest) = trimmed.strip_prefix("/tokensaver ") {
         rest
     } else {
         return false;
     };
 
-    let key = match parse_cooklabs_key(rest) {
+    let key = match parse_tokensaver_key(rest) {
         Ok(None) => {
-            app.push_display_message(DisplayMessage::system(cooklabs_usage().to_string()));
+            app.push_display_message(DisplayMessage::system(tokensaver_usage().to_string()));
             return true;
         }
         Ok(Some(key)) => key.to_string(),
@@ -70,23 +70,23 @@ pub(super) fn handle_cooklabs_command(app: &mut App, trimmed: &str) -> bool {
         }
     };
 
-    if app.cooklabs_command_running {
-        app.set_status_notice("Cook Labs command already running…");
+    if app.tokensaver_command_running {
+        app.set_status_notice("Token Saver command already running…");
         return true;
     }
-    app.cooklabs_command_running = true;
+    app.tokensaver_command_running = true;
 
     app.push_display_message(DisplayMessage::system(format!(
-        "Activating Cook Labs with key {}…",
+        "Activating Token Saver with key {}…",
         mask_key(&key)
     )));
-    app.set_status_notice("Cook Labs → activating");
+    app.set_status_notice("Token Saver → activating");
 
     let session_id = app.session.id.clone();
     std::thread::spawn(move || {
-        let result = run_cooklabs_activation(&key);
-        Bus::global().publish(BusEvent::CookLabsCommandCompleted(
-            CookLabsCommandCompleted { session_id, result },
+        let result = run_tokensaver_activation(&key);
+        Bus::global().publish(BusEvent::TokensaverCommandCompleted(
+            TokensaverCommandCompleted { session_id, result },
         ));
     });
 
@@ -94,11 +94,14 @@ pub(super) fn handle_cooklabs_command(app: &mut App, trimmed: &str) -> bool {
 }
 
 impl App {
-    pub(super) fn handle_cooklabs_command_completed(&mut self, event: CookLabsCommandCompleted) {
+    pub(super) fn handle_tokensaver_command_completed(
+        &mut self,
+        event: TokensaverCommandCompleted,
+    ) {
         if event.session_id != self.session.id {
             return;
         }
-        self.cooklabs_command_running = false;
+        self.tokensaver_command_running = false;
 
         match event.result {
             Ok(payload) => {
@@ -107,16 +110,16 @@ impl App {
             }
             Err(message) => {
                 self.push_display_message(DisplayMessage::error(message));
-                self.set_status_notice("Cook Labs command failed");
+                self.set_status_notice("Token Saver command failed");
             }
         }
     }
 }
 
-/// Parse the argument tail of `/cooklabs`, accepting an optional `activate`
+/// Parse the argument tail of `/tokensaver`, accepting an optional `activate`
 /// verb. Returns `Ok(None)` when no key was given (show instructions),
 /// `Ok(Some(key))` for a single-token key, and `Err(usage)` otherwise.
-fn parse_cooklabs_key(rest: &str) -> Result<Option<&str>, String> {
+fn parse_tokensaver_key(rest: &str) -> Result<Option<&str>, String> {
     let rest = rest.trim();
     // Only strip a whole `activate` verb, never a key that merely starts with
     // the word (e.g. `activatefoo`).
@@ -133,18 +136,18 @@ fn parse_cooklabs_key(rest: &str) -> Result<Option<&str>, String> {
     let mut parts = rest.split_whitespace();
     let key = parts.next().unwrap_or_default();
     if parts.next().is_some() {
-        return Err("Usage: /cooklabs <key> (a single portal key, no spaces)".to_string());
+        return Err("Usage: /tokensaver <key> (a single portal key, no spaces)".to_string());
     }
     Ok(Some(key))
 }
 
-fn cooklabs_usage() -> &'static str {
-    "Cook Labs activation\n\
+fn tokensaver_usage() -> &'static str {
+    "Token Saver activation\n\
      \n\
-     Grab your key from the Cook Labs portal Settings page\n\
-     (https://portal.cooklabs.dev), then paste it here:\n\
+     Grab your key from the Token Saver portal Settings page\n\
+     (https://portal.tokensaver.dev), then paste it here:\n\
      \n\
-     /cooklabs <key>\n\
+     /tokensaver <key>\n\
      \n\
      Once activated, run /tokensaverstats to see your savings."
 }
@@ -152,7 +155,7 @@ fn cooklabs_usage() -> &'static str {
 /// Friendly install pointer shown instead of an error when `rtk` is not on
 /// PATH.
 fn rtk_missing_message() -> String {
-    "Cook Labs Token Saver needs the rtk CLI, which is not installed yet.\n\
+    "Token Saver needs the rtk CLI, which is not installed yet.\n\
      \n\
      Install it with:\n\
      \n\
@@ -185,7 +188,7 @@ fn scrub_secret(text: &str, secret: &str) -> String {
 
 /// Format the `/tokensaverstats` transcript block.
 fn format_stats_block(gain: &str, history: Option<&str>) -> String {
-    let mut out = String::from("Cook Labs Token Saver\n=====================\n\n");
+    let mut out = String::from("Token Saver\n===========\n\n");
     let gain = gain.trim();
     if gain.is_empty() {
         out.push_str("No savings recorded yet - rtk starts metering as soon as jcode routes commands through it.");
@@ -275,11 +278,11 @@ fn drain_stream<R: Read + Send + 'static>(stream: Option<R>) -> std::thread::Joi
 }
 
 /// Off-thread body of `/tokensaverstats`.
-fn run_tokensaverstats() -> Result<CookLabsCommandPayload, String> {
+fn run_tokensaverstats() -> Result<TokensaverCommandPayload, String> {
     let gain = match run_rtk(&["gain"]) {
         Ok(output) => output,
         Err(RtkError::NotFound) => {
-            return Ok(CookLabsCommandPayload {
+            return Ok(TokensaverCommandPayload {
                 message: rtk_missing_message(),
                 notice: "rtk not installed".to_string(),
             });
@@ -303,21 +306,21 @@ fn run_tokensaverstats() -> Result<CookLabsCommandPayload, String> {
         .filter(|output| output.success)
         .map(|output| output.stdout);
 
-    Ok(CookLabsCommandPayload {
+    Ok(TokensaverCommandPayload {
         message: format_stats_block(&gain.stdout, history.as_deref()),
-        notice: "Cook Labs stats ready".to_string(),
+        notice: "Token Saver stats ready".to_string(),
     })
 }
 
-/// Off-thread body of `/cooklabs <key>`.
-fn run_cooklabs_activation(key: &str) -> Result<CookLabsCommandPayload, String> {
+/// Off-thread body of `/tokensaver <key>`.
+fn run_tokensaver_activation(key: &str) -> Result<TokensaverCommandPayload, String> {
     let portal_url =
-        std::env::var("COOKLABS_PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
+        std::env::var("TOKENSAVER_PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
 
     let login = match run_rtk(&["portal", "login", "--url", &portal_url, "--token", key]) {
         Ok(output) => output,
         Err(RtkError::NotFound) => {
-            return Ok(CookLabsCommandPayload {
+            return Ok(TokensaverCommandPayload {
                 message: rtk_missing_message(),
                 notice: "rtk not installed".to_string(),
             });
@@ -332,7 +335,7 @@ fn run_cooklabs_activation(key: &str) -> Result<CookLabsCommandPayload, String> 
             login.stderr
         };
         return Err(scrub_secret(
-            &format!("Cook Labs login failed: {}", detail.trim()),
+            &format!("Token Saver login failed: {}", detail.trim()),
             key,
         ));
     }
@@ -350,17 +353,17 @@ fn run_cooklabs_activation(key: &str) -> Result<CookLabsCommandPayload, String> 
             sync.stderr
         };
         return Err(scrub_secret(
-            &format!("Cook Labs sync check failed: {}", detail.trim()),
+            &format!("Token Saver sync check failed: {}", detail.trim()),
             key,
         ));
     }
 
-    Ok(CookLabsCommandPayload {
+    Ok(TokensaverCommandPayload {
         message: format!(
-            "Cook Labs activated (key {}) — run /tokensaverstats to see your savings.",
+            "Token Saver activated (key {}) — run /tokensaverstats to see your savings.",
             mask_key(key)
         ),
-        notice: "Cook Labs activated".to_string(),
+        notice: "Token Saver activated".to_string(),
     })
 }
 
@@ -400,34 +403,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_cooklabs_key_accepts_bare_and_activate_forms() {
-        assert_eq!(parse_cooklabs_key("my-key"), Ok(Some("my-key")));
-        assert_eq!(parse_cooklabs_key("activate my-key"), Ok(Some("my-key")));
+    fn parse_tokensaver_key_accepts_bare_and_activate_forms() {
+        assert_eq!(parse_tokensaver_key("my-key"), Ok(Some("my-key")));
+        assert_eq!(parse_tokensaver_key("activate my-key"), Ok(Some("my-key")));
         assert_eq!(
-            parse_cooklabs_key("  activate   my-key  "),
+            parse_tokensaver_key("  activate   my-key  "),
             Ok(Some("my-key"))
         );
         // A key that merely starts with the word `activate` stays intact.
-        assert_eq!(parse_cooklabs_key("activate9999"), Ok(Some("activate9999")));
+        assert_eq!(
+            parse_tokensaver_key("activate9999"),
+            Ok(Some("activate9999"))
+        );
     }
 
     #[test]
-    fn parse_cooklabs_key_without_key_asks_for_instructions() {
-        assert_eq!(parse_cooklabs_key(""), Ok(None));
-        assert_eq!(parse_cooklabs_key("activate"), Ok(None));
-        assert_eq!(parse_cooklabs_key("   "), Ok(None));
+    fn parse_tokensaver_key_without_key_asks_for_instructions() {
+        assert_eq!(parse_tokensaver_key(""), Ok(None));
+        assert_eq!(parse_tokensaver_key("activate"), Ok(None));
+        assert_eq!(parse_tokensaver_key("   "), Ok(None));
     }
 
     #[test]
-    fn parse_cooklabs_key_rejects_extra_tokens() {
-        assert!(parse_cooklabs_key("one two").is_err());
-        assert!(parse_cooklabs_key("activate one two").is_err());
+    fn parse_tokensaver_key_rejects_extra_tokens() {
+        assert!(parse_tokensaver_key("one two").is_err());
+        assert!(parse_tokensaver_key("activate one two").is_err());
     }
 
     #[test]
     fn format_stats_block_includes_header_and_history() {
         let block = format_stats_block("saved 12000 tokens", Some("git log: 80%\n"));
-        assert!(block.starts_with("Cook Labs Token Saver\n"));
+        assert!(block.starts_with("Token Saver\n"));
         assert!(block.contains("saved 12000 tokens"));
         assert!(block.contains("Recent history"));
         assert!(block.contains("git log: 80%"));
@@ -436,7 +442,7 @@ mod tests {
     #[test]
     fn format_stats_block_without_history_or_data() {
         let block = format_stats_block("  ", None);
-        assert!(block.starts_with("Cook Labs Token Saver\n"));
+        assert!(block.starts_with("Token Saver\n"));
         assert!(block.contains("No savings recorded yet"));
         assert!(!block.contains("Recent history"));
     }
