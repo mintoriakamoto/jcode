@@ -96,6 +96,13 @@ run_gate "wildcard re-export ratchet" python3 scripts/check_wildcard_reexport_bu
 run_gate "desktop2 frame budget (state-space sweep)" \
     cargo test --profile selfdev -p jcode-desktop2 -j "$JOBS" profile:: -- --test-threads=1
 
+# Tool schemas ride on every request, so growth is a permanent per-turn token
+# cost for every user. Fast (the registry builds in well under a second once
+# built), so it stays out of --skip-slow for the same reason as the frame budget.
+run_gate "tool-schema token budget" \
+    cargo test --profile selfdev -p jcode-app-core -j "$JOBS" --lib \
+    tool_schema_surface_stays_within_token_budget
+
 if $SKIP_SLOW; then
     :
 elif command -v cargo-machete >/dev/null 2>&1; then

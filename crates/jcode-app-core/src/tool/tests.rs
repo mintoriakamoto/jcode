@@ -423,6 +423,77 @@ fn resolve_tool_name_maps_communicate_to_swarm() {
     assert_eq!(Registry::resolve_tool_name("communicate"), "swarm");
 }
 
+/// Ratchet on the per-request tool-schema surface.
+///
+/// Every registered tool's full JSON schema is sent on EVERY request, so this
+/// is a fixed input-token floor paid by every turn of every session — the
+/// single largest recurring component of a request that is not conversation.
+/// Measured 2026-07: ~12.3k tokens across 28 tools. Prompt caching makes the
+/// steady-state cost the cheaper cache-read rate, but the tool block is the
+/// cache *prefix*: growing it re-writes the whole cached prompt, and a
+/// mid-session tool registration invalidates it outright.
+///
+/// This is a ratchet, not a design limit. If a change intentionally grows the
+/// surface, raise the constant in the same commit and say why in the message.
+/// Use `print_tool_definition_token_report` (‑‑ignored) for a per-tool
+/// breakdown when this trips.
+const TOOL_SCHEMA_TOKEN_BUDGET: usize = 13_000;
+
+/// No single tool should quietly take over the shared budget. `swarm` is the
+/// current outlier at ~3.1k tokens (25% of the total on its own).
+const SINGLE_TOOL_TOKEN_BUDGET: usize = 3_300;
+
+/// Excluded so the budget is identical on every OS: these are registered only
+/// on some platforms, and a cross-platform ratchet must compare like with like.
+const PLATFORM_GATED_TOOLS: &[&str] = &["macos_computer_use"];
+
+#[tokio::test]
+async fn tool_schema_surface_stays_within_token_budget() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let defs: Vec<ToolDefinition> = registry
+        .definitions(None)
+        .await
+        .into_iter()
+        .filter(|def| !PLATFORM_GATED_TOOLS.contains(&def.name.as_str()))
+        .collect();
+
+    assert!(
+        !defs.is_empty(),
+        "no tool definitions registered; the budget check would be vacuous"
+    );
+
+    let mut by_cost: Vec<(String, usize)> = defs
+        .iter()
+        .map(|def| (def.name.clone(), def.prompt_token_estimate()))
+        .collect();
+    by_cost.sort_by_key(|(_, tokens)| std::cmp::Reverse(*tokens));
+    let total: usize = by_cost.iter().map(|(_, tokens)| tokens).sum();
+
+    let top: Vec<String> = by_cost
+        .iter()
+        .take(5)
+        .map(|(name, tokens)| format!("{name}={tokens}"))
+        .collect();
+
+    assert!(
+        total <= TOOL_SCHEMA_TOKEN_BUDGET,
+        "tool schemas now cost ~{total} tokens on every request (budget {TOOL_SCHEMA_TOKEN_BUDGET}). \
+         Largest: {}. Either shrink a schema or raise TOOL_SCHEMA_TOKEN_BUDGET in this commit \
+         and justify the added per-request cost.",
+        top.join(", ")
+    );
+
+    if let Some((name, tokens)) = by_cost.first() {
+        assert!(
+            *tokens <= SINGLE_TOOL_TOKEN_BUDGET,
+            "tool `{name}` alone costs ~{tokens} tokens per request \
+             (single-tool budget {SINGLE_TOOL_TOKEN_BUDGET}). Trim its schema, or raise \
+             SINGLE_TOOL_TOKEN_BUDGET in this commit and justify it."
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn print_tool_definition_token_report() {

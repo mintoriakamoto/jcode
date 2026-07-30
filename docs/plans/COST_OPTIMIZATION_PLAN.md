@@ -185,7 +185,16 @@ so forks run the 120-min QEMU build weekly.
 Per-request input floor is ~15-17k tokens; **~85-90% of it is tool schemas**.
 The system prompt itself is small (~490 tokens) and correctly cache-split.
 
-- **~13-15k tokens of always-on tool schemas, no lazy loading.** ~28 tools are
+- **~12.3k tokens of always-on tool schemas, no lazy loading.** *(Measured
+  2026-07 via `print_tool_definition_token_report`, superseding the earlier
+  13-15k source-size estimate. Now guarded by
+  `tool_schema_surface_stays_within_token_budget`, wired into CI's quality job
+  and `check_guardrails.sh`.)* Per-tool, the cost is concentrated:
+  `swarm` 3084, `todo` 1140, `discover_tools` 1019, `session_search` 784,
+  `bg` 711 — the top five are ~55% of the total. Note the cost is **schemas,
+  not descriptions**: `todo` spends 1140 tokens with an 18-token description,
+  and `session_search` 784 with 26. Any reduction work should target schema
+  shape (enums, nested objects), not prose. ~28 tools are
   always registered (`jcode-app-core/src/tool/mod.rs:152-256`) and
   `definitions()` returns all of them every request (`mod.rs:319`). Four tools
   (swarm ~14 KB, schedule ~8.7 KB, todo ~7.3 KB, session_search ~5 KB of
@@ -296,6 +305,45 @@ Deliberately NOT done, with reasons:
   `subscription_activated`, `account_linked`, `daily_active_users`) is real
   and still needed, but it deletes historical analytics data. That is the
   owner's call, not a change to make unilaterally.
+
+## CI does not run most unit tests
+
+Found while auditing 2026-07. `ci.yml` compiles the library test binaries
+(`cargo test --lib --bins --no-run`) but only *runs*:
+
+- `-p jcode-app-core --lib retention_readiness` (a single filter),
+- `-p jcode-tui --lib` (full, serial, with documented skips),
+- the `provider_matrix` and `e2e` integration targets.
+
+So `jcode-app-core`'s other lib tests and **all** of `jcode-base`'s lib tests
+never execute in CI. Consequence: master currently carries 10 failing unit
+tests that CI cannot see. Reproduced on a clean `origin/master` worktree:
+
+- `tool::bash::tests::bash_holds_a_risky_delete_until_justified_then_runs_it`
+  — a *safety* test. It expects a risky `rm -rf` to be held for justification.
+  The fixture builds its "outside the working directory" target with
+  `tempfile::tempdir()`, which lands under `/tmp`; `paths.rs:270` allow-lists
+  `/tmp`, `/var/tmp`, `/private/tmp` as disposable, so the finding is dropped
+  and the command runs immediately. Confirmed environmental: the test passes
+  with `TMPDIR` set outside that allow-list (which is why hosted runners would
+  pass it). The classifier is behaving as documented — the *test* is wrong, and
+  as written it does not verify the gate at all on a stock Linux box. A real
+  fix means making the temp allow-list injectable via `RiskContext` rather
+  than editing the assertion.
+- `jcode-base`: `auth::cursor` vscdb ×6, `auth::copilot::save_github_token…`,
+  `browser::browser_tests::test_paths`, `dictation::…trims_trailing_newlines`
+  — all environment-dependent.
+
+Enabling those suites in CI would turn it red immediately, so the fix is
+sequenced: repair or explicitly skip the environmental tests first (the TUI job
+already models the honest-skip pattern), then run the suites.
+
+Separately, **master is currently failing two of its own ratchets** (verified
+on a clean checkout at 6019d2b): the swallowed-error budget (`cooklabs.rs` adds
+9 unbaselined usages) and the code-size budget (7 files grew, incl.
+`bash.rs` 1280→1380 and `auth/mod.rs` 1489→1561). Those need a rebaseline or a
+reduction on master; they were deliberately NOT absorbed into this branch's
+baselines.
 
 ## Findings retracted on verification
 

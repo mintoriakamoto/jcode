@@ -101,6 +101,14 @@ jobs:
         shell: bash
         run: "cargo test -p jcode-desktop2 profile:: -- --test-threads=1"
 
+      # Tool schemas are sent on every request, so growth here is a permanent
+      # per-turn input-token cost for every user. jcode-app-core's lib tests are
+      # otherwise only compiled in CI (`--lib --bins --no-run`), never run, so
+      # this gate has to be named explicitly to have any effect.
+      - name: Enforce tool-schema token budget
+        shell: bash
+        run: "cargo test -p jcode-app-core --lib tool_schema_surface_stays_within_token_budget"
+
       # Prebuilt binary: `cargo install` compiled cargo-machete from source on
       # every run (rust-cache does not cache ~/.cargo/bin).
       - name: Install cargo-machete
