@@ -183,10 +183,6 @@ pub(super) fn handle_bus_event(
             app.handle_productivity_report_ready(event);
             true
         }
-        Ok(BusEvent::TokensaverCommandCompleted(event)) => {
-            app.handle_tokensaver_command_completed(event);
-            true
-        }
         Ok(BusEvent::MermaidRenderCompleted) => true,
         Ok(BusEvent::UsageReport(results)) => {
             app.handle_usage_report(results);

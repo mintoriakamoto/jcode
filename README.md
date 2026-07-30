@@ -43,13 +43,6 @@ irm https://jcode.sh/install.ps1 | iex
 Need Homebrew, source builds, provider setup, or want an agent to set it up for you?
 [Jump to detailed installation](#detailed-installation).
 
-> **Token Saver built in.** This fork auto-routes shell commands through the
-> [rtk](https://github.com/mintoriakamoto/rtk) engine when installed (opt out
-> with `JCODE_RTK=0`); `/tokensaverstats` and `/tokensaver` show your savings
-> in-agent. Accounts, credits, and billing live in the
-> [Token Saver portal](https://github.com/mintoriakamoto/Portal-Scaffold-) —
-> jcode stays a standalone agent.
-
 ---
 
 
