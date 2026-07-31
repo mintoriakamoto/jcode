@@ -42,9 +42,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check all targets and all features
-        run: cargo check --all-targets --all-features
-
+      # clippy runs the full check pass with the same flags, so a separate
+      # `cargo check --all-targets --all-features` step here would be pure
+      # duplicated compile time.
       - name: Run clippy with warnings denied
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -101,11 +101,24 @@ jobs:
         shell: bash
         run: "cargo test -p jcode-desktop2 profile:: -- --test-threads=1"
 
+      # Tool schemas are sent on every request, so growth here is a permanent
+      # per-turn input-token cost for every user. jcode-app-core's lib tests are
+      # otherwise only compiled in CI (`--lib --bins --no-run`), never run, so
+      # this gate has to be named explicitly to have any effect.
+      - name: Enforce tool-schema token budget
+        shell: bash
+        run: "cargo test -p jcode-app-core --lib tool_schema_surface_stays_within_token_budget"
+
+      # Prebuilt binary: `cargo install` compiled cargo-machete from source on
+      # every run (rust-cache does not cache ~/.cargo/bin).
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
       - name: Enforce no unused dependencies
         shell: bash
-        run: |
-          cargo install cargo-machete --locked
-          cargo machete
+        run: cargo machete
 
   release-automation:
     name: Release Automation
@@ -283,12 +296,18 @@ jobs:
         run: |
           scripts/check_warning_budget.sh
 
+      # Prebuilt binary: `cargo install` compiled cargo-audit from source on
+      # every run (rust-cache does not cache ~/.cargo/bin).
+      - name: Install cargo-audit (Linux)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
       - name: Security preflight (Linux)
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          cargo install cargo-audit --locked
-          scripts/security_preflight.sh --strict
+        run: scripts/security_preflight.sh --strict
 
   windows-build-test:
     name: Build & Test (windows-latest)
@@ -534,8 +553,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld llvm ninja-build
 
+      # Prebuilt binary via install-action (binstall fallback). The previous
+      # `cargo install --git` recompiled from an unpinned git HEAD on every
+      # run — slow and a supply-chain risk.
       - name: Install cargo-xwin
-        run: cargo install --git https://github.com/rust-cross/cargo-xwin cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
 
       - name: Check Windows x64 target
         run: cargo xwin check --locked --target x86_64-pc-windows-msvc

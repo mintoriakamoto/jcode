@@ -82,6 +82,68 @@ let lastObservedDbSizeBytes = 0;
 let lastEmergencyPruneAtMs = 0;
 
 // ---------------------------------------------------------------------------
+// Flood guard for the public POST /v1/event endpoint.
+//
+// The endpoint is anonymous and unauthenticated by design, so write volume —
+// and therefore D1 row cost plus Analytics Engine datapoint cost — is
+// controlled by whoever is sending. This is a per-isolate, best-effort
+// counter: it stops a single runaway or naive flooding client, but a
+// determined attacker rotating `id` values (or spread across isolates) is NOT
+// stopped by it. Cloudflare edge Rate Limiting rules on the route, keyed by
+// IP, remain the real control; see docs/plans/COST_OPTIMIZATION_PLAN.md.
+//
+// The ceiling is deliberately ~10x above any plausible real client: a busy
+// user running 10 concurrent sessions emits on the order of tens of events
+// per minute, not hundreds. Anything that trips this is not normal use. Every
+// failure path here falls open (event is accepted), because dropping real
+// telemetry is worse than admitting an occasional excess event.
+// ---------------------------------------------------------------------------
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_EVENTS_PER_ID = 600;
+const RATE_LIMIT_MAX_TRACKED_IDS = 10_000;
+const rateLimitBuckets = new Map();
+
+// Exported for tests; resets the per-isolate counters.
+export function __resetRateLimitState() {
+  rateLimitBuckets.clear();
+}
+
+function rateLimitExceeded(id) {
+  try {
+    if (typeof id !== "string" || id.length === 0) {
+      return false;
+    }
+    const now = Date.now();
+    const bucket = rateLimitBuckets.get(id);
+    if (bucket && now - bucket.windowStart < RATE_LIMIT_WINDOW_MS) {
+      bucket.count += 1;
+      return bucket.count > RATE_LIMIT_MAX_EVENTS_PER_ID;
+    }
+    // New id, or its window elapsed. Re-inserting moves it to the end of the
+    // Map's insertion order, so eviction below drops the least recently
+    // started windows first.
+    rateLimitBuckets.delete(id);
+    rateLimitBuckets.set(id, { windowStart: now, count: 1 });
+    if (rateLimitBuckets.size > RATE_LIMIT_MAX_TRACKED_IDS) {
+      const excess = rateLimitBuckets.size - RATE_LIMIT_MAX_TRACKED_IDS;
+      let evicted = 0;
+      for (const key of rateLimitBuckets.keys()) {
+        if (evicted >= excess) {
+          break;
+        }
+        rateLimitBuckets.delete(key);
+        evicted += 1;
+      }
+    }
+    return false;
+  } catch (err) {
+    // Fail open: never let the guard itself reject real telemetry.
+    console.warn("rate limit check failed", err?.message || err);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Workers Analytics Engine firehose.
 //
 // Every event is written to the FIREHOSE dataset before the D1 insert. AE is
@@ -427,6 +489,13 @@ export default {
       return jsonResponse({ error: "Unknown event type" }, 400, cors);
     }
 
+    // Guard the billable writes (Analytics Engine datapoint + D1 rows) that
+    // follow. Placed after validation so malformed input keeps its existing
+    // 400 semantics.
+    if (rateLimitExceeded(body.id)) {
+      return jsonResponse({ error: "Rate limit exceeded" }, 429, cors);
+    }
+
     if (SUBSCRIPTION_EVENTS.includes(body.event)) {
       const problem = normalizeSubscriptionEvent(body);
       if (problem) {
@@ -685,10 +754,12 @@ async function insertEvent(env, body) {
       ["arch", body.arch],
       ...common,
     ].filter(([name]) => columns.has(name));
-    const inserted = await insertEventRow(env, body, values);
-    if (inserted) {
-      await insertDiscoveryDetails(env, body, await getDiscoveryDetailColumns(env));
-    }
+    await insertEventRow(
+      env,
+      body,
+      values,
+      prepareDiscoveryDetails(env, body, await getDiscoveryDetailColumns(env)),
+    );
     return;
   }
 
@@ -701,10 +772,12 @@ async function insertEvent(env, body) {
       ["arch", body.arch],
       ...common,
     ].filter(([name]) => columns.has(name));
-    const inserted = await insertEventRow(env, body, values);
-    if (inserted) {
-      await insertWebDetails(env, body, await getWebDetailColumns(env));
-    }
+    await insertEventRow(
+      env,
+      body,
+      values,
+      prepareWebDetails(env, body, await getWebDetailColumns(env)),
+    );
     return;
   }
 
@@ -733,30 +806,32 @@ async function insertEvent(env, body) {
       ["arch", body.arch],
       ...common,
     ].filter(([name]) => columns.has(name));
-    const inserted = await insertEventRow(env, body, values);
-    if (inserted) {
-      await insertInstallDetails(env, body, installDetailColumns);
-    }
+    await insertEventRow(
+      env,
+      body,
+      values,
+      prepareInstallDetails(env, body, installDetailColumns),
+    );
     return;
   }
 
   if (body.event === "install") {
-    const inserted = await insertEventRow(env, body, [
+    const firstRunDetail = body.conversion_id
+      ? prepareInstallDetails(env, {
+          ...body,
+          stage: "first_run",
+          outcome: "success",
+          source: "cli",
+        }, installDetailColumns)
+      : null;
+    await insertEventRow(env, body, [
       ["telemetry_id", body.id],
       ["event", body.event],
       ["version", body.version],
       ["os", body.os],
       ["arch", body.arch],
       ...common,
-    ].filter(([name]) => columns.has(name)));
-    if (inserted && body.conversion_id) {
-      await insertInstallDetails(env, {
-        ...body,
-        stage: "first_run",
-        outcome: "success",
-        source: "cli",
-      }, installDetailColumns);
-    }
+    ].filter(([name]) => columns.has(name)), firstRunDetail);
     return;
   }
 
@@ -861,10 +936,12 @@ async function insertEvent(env, body) {
       ["turn_end_reason", body.turn_end_reason || null],
       ...common,
     ].filter(([name]) => columns.has(name));
-    const inserted = await insertEventRow(env, body, values);
-    if (inserted) {
-      await insertTurnDetails(env, body, turnDetailColumns);
-    }
+    await insertEventRow(
+      env,
+      body,
+      values,
+      prepareTurnDetails(env, body, turnDetailColumns),
+    );
     return;
   }
 
@@ -963,19 +1040,52 @@ async function insertEvent(env, body) {
       ["error_rate_limited", errors.rate_limited || 0],
       ...common,
     ].filter(([name]) => columns.has(name));
-    const inserted = await insertEventRow(env, body, values);
-    if (inserted) {
-      await insertSessionDetails(env, body, sessionDetailColumns);
-    }
+    await insertEventRow(
+      env,
+      body,
+      values,
+      prepareSessionDetails(env, body, sessionDetailColumns),
+    );
     return;
   }
 }
 
-async function insertEventRow(env, body, entries) {
+async function insertEventRow(env, body, entries, detailStmt = null) {
   const result = await insertDynamic(env, "events", entries);
   const inserted = wasInserted(result);
-  if (inserted) {
-    await recordDailyActivity(env, body);
+  if (!inserted) {
+    return false;
+  }
+  const dailyStmt = prepareDailyActivity(env, body);
+  const followups = [detailStmt, dailyStmt].filter(Boolean);
+  if (followups.length > 0) {
+    try {
+      // One D1 round trip (and one transaction) for the detail row plus the
+      // daily-active rollup; each was previously a separate awaited statement
+      // billed and subrequest-counted on every event.
+      const results = await env.DB.batch(followups);
+      for (const r of results) {
+        observeDbSize(r);
+      }
+    } catch (err) {
+      // Batches are transactional, so nothing above persisted. Re-run with
+      // the pre-batch semantics: the daily rollup stays best-effort (older
+      // databases may not have the rollup migration yet; raw events remain
+      // the source of truth) while a detail-insert failure propagates so the
+      // caller's db-full detection still fires.
+      if (dailyStmt) {
+        try {
+          observeDbSize(await dailyStmt.run());
+        } catch (dailyErr) {
+          console.warn("daily activity rollup failed", dailyErr?.message || dailyErr);
+        }
+      }
+      if (detailStmt) {
+        observeDbSize(await detailStmt.run());
+      } else {
+        throw err;
+      }
+    }
   }
   return inserted;
 }
@@ -984,9 +1094,9 @@ function wasInserted(result) {
   return (result?.meta?.changes ?? result?.changes ?? 0) > 0;
 }
 
-async function insertTurnDetails(env, body, columns) {
+function prepareTurnDetails(env, body, columns) {
   if (!columns || columns.size === 0 || !body.event_id || !columns.has("event_id")) {
-    return;
+    return null;
   }
   const values = [
     ["event_id", body.event_id],
@@ -1054,14 +1164,12 @@ async function insertTurnDetails(env, body, columns) {
     ["workflow_subagent_used", boolToInt(body.workflow_subagent_used)],
     ["workflow_swarm_used", boolToInt(body.workflow_swarm_used)],
   ].filter(([name]) => columns.has(name));
-  if (values.length > 1) {
-    await insertDynamic(env, 'turn_details', values);
-  }
+  return values.length > 1 ? prepareDynamic(env, 'turn_details', values) : null;
 }
 
-async function recordDailyActivity(env, body) {
+function prepareDailyActivity(env, body) {
   if (!["session_start", "turn_end", "session_end", "session_crash"].includes(body.event)) {
-    return;
+    return null;
   }
 
   const activityDate = new Date().toISOString().slice(0, 10);
@@ -1074,8 +1182,7 @@ async function recordDailyActivity(env, body) {
   const sessionEndCount = body.event === "session_end" ? 1 : 0;
   const sessionCrashCount = body.event === "session_crash" ? 1 : 0;
 
-  try {
-    await env.DB.prepare(`
+  return env.DB.prepare(`
       INSERT INTO daily_active_users (
         activity_date,
         telemetry_id,
@@ -1117,12 +1224,7 @@ async function recordDailyActivity(env, body) {
       isCi,
       isCi,
       body.build_channel || null,
-    ).run();
-  } catch (err) {
-    // Older databases may not have the rollup migration yet. Do not reject the
-    // canonical event insert, because raw events remain the source of truth.
-    console.warn("daily activity rollup failed", err?.message || err);
-  }
+    );
 }
 
 function isMeaningfulLifecycleEvent(body) {
@@ -1164,9 +1266,9 @@ function isMeaningfulLifecycleEvent(body) {
   return false;
 }
 
-async function insertSessionDetails(env, body, columns) {
+function prepareSessionDetails(env, body, columns) {
   if (!columns || columns.size === 0 || !body.event_id || !columns.has("event_id")) {
-    return;
+    return null;
   }
   const values = [
     ["event_id", body.event_id],
@@ -1229,9 +1331,7 @@ async function insertSessionDetails(env, body, columns) {
     ["active_days_7d", body.active_days_7d || 0],
     ["active_days_30d", body.active_days_30d || 0],
   ].filter(([name]) => columns.has(name));
-  if (values.length > 1) {
-    await insertDynamic(env, 'session_details', values);
-  }
+  return values.length > 1 ? prepareDynamic(env, 'session_details', values) : null;
 }
 
 function commonEventEntries(body, columns) {
@@ -1334,9 +1434,9 @@ async function getDiscoveryDetailColumns(env) {
   return cachedDiscoveryDetailColumns;
 }
 
-async function insertDiscoveryDetails(env, body, columns) {
+function prepareDiscoveryDetails(env, body, columns) {
   if (!columns || columns.size === 0 || !body.event_id || !columns.has("event_id")) {
-    return;
+    return null;
   }
   const values = [
     ["event_id", body.event_id],
@@ -1355,14 +1455,12 @@ async function insertDiscoveryDetails(env, body, columns) {
     ["custom_endpoint", boolToInt(body.custom_endpoint)],
     ["benchmark_run", boolToInt(body.benchmark_run)],
   ].filter(([name]) => columns.has(name));
-  if (values.length > 1) {
-    await insertDynamic(env, "discovery_details", values);
-  }
+  return values.length > 1 ? prepareDynamic(env, "discovery_details", values) : null;
 }
 
-async function insertWebDetails(env, body, columns) {
+function prepareWebDetails(env, body, columns) {
   if (!columns || columns.size === 0 || !body.event_id || !columns.has("event_id")) {
-    return;
+    return null;
   }
   const values = [
     ["event_id", body.event_id],
@@ -1382,14 +1480,12 @@ async function insertWebDetails(env, body, columns) {
     ["placement", body.placement || null],
     ["install_method", body.install_method || null],
   ].filter(([name]) => columns.has(name));
-  if (values.length > 1) {
-    await insertDynamic(env, "web_details", values);
-  }
+  return values.length > 1 ? prepareDynamic(env, "web_details", values) : null;
 }
 
-async function insertInstallDetails(env, body, columns) {
+function prepareInstallDetails(env, body, columns) {
   if (!columns || columns.size === 0 || !body.event_id || !columns.has("event_id")) {
-    return;
+    return null;
   }
   const values = [
     ["event_id", body.event_id],
@@ -1401,9 +1497,7 @@ async function insertInstallDetails(env, body, columns) {
     ["install_method", body.install_method || null],
     ["failure_stage", body.failure_stage || null],
   ].filter(([name]) => columns.has(name));
-  if (values.length > 1) {
-    await insertDynamic(env, "install_details", values);
-  }
+  return values.length > 1 ? prepareDynamic(env, "install_details", values) : null;
 }
 
 // Normalize a website beacon event in place. Browsers do not send
@@ -1595,12 +1689,16 @@ function normalizeDiscoveryEvent(body) {
   return null;
 }
 
-async function insertDynamic(env, table, entries) {
+function prepareDynamic(env, table, entries) {
   const columns = entries.map(([name]) => name);
   const placeholders = columns.map(() => "?").join(", ");
   const sql = `INSERT OR IGNORE INTO ${table} (${columns.join(", ")}) VALUES (${placeholders})`;
   const values = entries.map(([, value]) => value);
-  const result = await env.DB.prepare(sql).bind(...values).run();
+  return env.DB.prepare(sql).bind(...values);
+}
+
+async function insertDynamic(env, table, entries) {
+  const result = await prepareDynamic(env, table, entries).run();
   observeDbSize(result);
   return result;
 }

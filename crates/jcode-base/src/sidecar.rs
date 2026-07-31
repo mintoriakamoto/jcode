@@ -183,6 +183,23 @@ impl Sidecar {
         }
     }
 
+    /// Whether this sidecar runs on a dedicated fast/cheap model rather than
+    /// dispatching back to the (typically expensive) live session provider.
+    /// Cost-motivated callers (e.g. compaction summarization) should skip the
+    /// sidecar when this is false: the `Provider` backend would route to the
+    /// same model they are trying to avoid.
+    pub fn has_dedicated_cheap_backend(&self) -> bool {
+        !matches!(self.backend, SidecarBackend::Provider)
+    }
+
+    /// Override the response token budget. The default (1024) is sized for
+    /// short memory judgments; larger tasks like compaction summaries need
+    /// more room.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
     /// Return the currently selected backend label.
     pub fn backend_name(&self) -> &'static str {
         match self.backend {

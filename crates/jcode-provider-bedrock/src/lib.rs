@@ -12,10 +12,10 @@ use aws_sdk_bedrock::Client as BedrockControlClient;
 use aws_sdk_bedrockruntime::Client as BedrockRuntimeClient;
 #[cfg(feature = "aws-sdk")]
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
-    ImageBlock, ImageFormat, ImageSource, InferenceConfiguration, Message,
-    ReasoningContentBlockDelta, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
-    ToolSpecification,
+    CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
+    ConversationRole, ConverseStreamOutput, ImageBlock, ImageFormat, ImageSource,
+    InferenceConfiguration, Message, ReasoningContentBlockDelta, SystemContentBlock, Tool,
+    ToolConfiguration, ToolInputSchema, ToolSpecification,
 };
 #[cfg(feature = "aws-sdk")]
 use aws_smithy_types::Blob;
@@ -624,11 +624,11 @@ impl BedrockProvider {
     }
 
     #[cfg(feature = "aws-sdk")]
-    fn tool_config(tools: &[ToolDefinition]) -> Option<ToolConfiguration> {
+    fn tool_config(tools: &[ToolDefinition], add_cache_point: bool) -> Option<ToolConfiguration> {
         if tools.is_empty() {
             return None;
         }
-        let bedrock_tools = tools
+        let mut bedrock_tools = tools
             .iter()
             .filter_map(|tool| {
                 let input_schema = Self::bedrock_input_schema(&tool.input_schema);
@@ -645,11 +645,87 @@ impl BedrockProvider {
         if bedrock_tools.is_empty() {
             None
         } else {
+            if add_cache_point && let Some(cache_point) = Self::cache_point_block() {
+                // Tool definitions are the largest stable request prefix;
+                // a trailing cache point makes them a cache hit on every
+                // follow-up request (Bedrock is pure pay-per-token).
+                bedrock_tools.push(Tool::CachePoint(cache_point));
+            }
             ToolConfiguration::builder()
                 .set_tools(Some(bedrock_tools))
                 .build()
                 .ok()
         }
+    }
+
+    /// Whether this Bedrock model supports `cachePoint` prompt-caching blocks.
+    ///
+    /// Conservative allow-list: sending a cache point to an unsupported model
+    /// fails the whole request with a validation error, so unknown or older
+    /// model families simply skip caching (correct, just not discounted).
+    #[cfg(feature = "aws-sdk")]
+    fn model_supports_cache_point(model: &str) -> bool {
+        const FAMILIES: [&str; 11] = [
+            "claude-3-5-haiku",
+            "claude-3-5-sonnet-v2",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet",
+            "claude-sonnet-4",
+            "claude-opus-4",
+            "claude-haiku-4",
+            "nova-micro",
+            "nova-lite",
+            "nova-pro",
+            "nova-premier",
+        ];
+        let lower = model.to_ascii_lowercase();
+        FAMILIES.iter().any(|family| lower.contains(family))
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    fn cache_point_block() -> Option<CachePointBlock> {
+        CachePointBlock::builder()
+            .r#type(CachePointType::Default)
+            .build()
+            .ok()
+    }
+
+    /// Append cache points at the end of the last two assistant messages,
+    /// mirroring the native Anthropic provider's sliding two-marker strategy:
+    /// the older marker re-reads the prefix the previous request wrote, the
+    /// newer one writes the extended prefix for the next request.
+    #[cfg(feature = "aws-sdk")]
+    fn add_message_cache_points(messages: Vec<Message>) -> Vec<Message> {
+        let mark: std::collections::HashSet<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| matches!(message.role(), ConversationRole::Assistant))
+            .map(|(index, _)| index)
+            .rev()
+            .take(2)
+            .collect();
+        if mark.is_empty() {
+            return messages;
+        }
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| {
+                if !mark.contains(&index) {
+                    return message;
+                }
+                let Some(cache_point) = Self::cache_point_block() else {
+                    return message;
+                };
+                let mut content = message.content().to_vec();
+                content.push(ContentBlock::CachePoint(cache_point));
+                Message::builder()
+                    .role(message.role().clone())
+                    .set_content(Some(content))
+                    .build()
+                    .unwrap_or(message)
+            })
+            .collect()
     }
 
     #[cfg(feature = "aws-sdk")]
@@ -1162,9 +1238,13 @@ impl Provider for BedrockProvider {
         Self::validate_credentials_if_requested().await?;
         let model = self.model();
         let info = Self::model_info(&model);
-        let request_messages = Self::to_bedrock_messages(messages, info.supports_vision)?;
+        let cache_points = Self::model_supports_cache_point(&model);
+        let mut request_messages = Self::to_bedrock_messages(messages, info.supports_vision)?;
+        if cache_points {
+            request_messages = Self::add_message_cache_points(request_messages);
+        }
         let tool_config = if info.supports_tools {
-            Self::tool_config(tools)
+            Self::tool_config(tools, cache_points)
         } else {
             None
         };
@@ -1172,7 +1252,14 @@ impl Provider for BedrockProvider {
         let system_blocks = if system.trim().is_empty() {
             None
         } else {
-            Some(vec![SystemContentBlock::Text(system.to_string())])
+            let mut blocks = vec![SystemContentBlock::Text(system.to_string())];
+            if cache_points && let Some(cache_point) = Self::cache_point_block() {
+                // The system prompt reaching this provider is static (dynamic
+                // per-turn content arrives as a message via the trait's
+                // complete_split default), so caching the whole block is safe.
+                blocks.push(SystemContentBlock::CachePoint(cache_point));
+            }
+            Some(blocks)
         };
         let message_items = serde_json::to_value(messages)
             .ok()
@@ -1298,8 +1385,12 @@ impl Provider for BedrockProvider {
                                     .send(Ok(StreamEvent::TokenUsage {
                                         input_tokens: Some(usage.input_tokens() as u64),
                                         output_tokens: Some(usage.output_tokens() as u64),
-                                        cache_read_input_tokens: None,
-                                        cache_creation_input_tokens: None,
+                                        cache_read_input_tokens: usage
+                                            .cache_read_input_tokens()
+                                            .map(|tokens| tokens.max(0) as u64),
+                                        cache_creation_input_tokens: usage
+                                            .cache_write_input_tokens()
+                                            .map(|tokens| tokens.max(0) as u64),
                                     }))
                                     .await;
                             }
@@ -1961,6 +2052,65 @@ mod tests {
 
         assert!(!route.available);
         assert!(route.detail.contains("legacy"));
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    #[test]
+    fn cache_point_support_is_family_gated() {
+        assert!(BedrockProvider::model_supports_cache_point(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        ));
+        assert!(BedrockProvider::model_supports_cache_point(
+            "anthropic.claude-3-5-haiku-20241022-v1:0"
+        ));
+        assert!(BedrockProvider::model_supports_cache_point(
+            "us.amazon.nova-pro-v1:0"
+        ));
+        // Older/unknown families must NOT get cache points: Bedrock rejects
+        // the whole request with a validation error.
+        assert!(!BedrockProvider::model_supports_cache_point(
+            "anthropic.claude-v2:1"
+        ));
+        assert!(!BedrockProvider::model_supports_cache_point(
+            "meta.llama3-70b-instruct-v1:0"
+        ));
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    #[test]
+    fn message_cache_points_land_on_last_two_assistant_messages() {
+        let text_message = |role: ConversationRole, text: &str| {
+            Message::builder()
+                .role(role)
+                .content(ContentBlock::Text(text.to_string()))
+                .build()
+                .expect("message")
+        };
+        let messages = vec![
+            text_message(ConversationRole::User, "u1"),
+            text_message(ConversationRole::Assistant, "a1"),
+            text_message(ConversationRole::User, "u2"),
+            text_message(ConversationRole::Assistant, "a2"),
+            text_message(ConversationRole::User, "u3"),
+            text_message(ConversationRole::Assistant, "a3"),
+        ];
+        let marked = BedrockProvider::add_message_cache_points(messages);
+        let has_cache_point = |message: &Message| {
+            message
+                .content()
+                .iter()
+                .any(|block| matches!(block, ContentBlock::CachePoint(_)))
+        };
+        assert!(!has_cache_point(&marked[1]), "oldest assistant unmarked");
+        assert!(has_cache_point(&marked[3]));
+        assert!(has_cache_point(&marked[5]));
+        assert!(!has_cache_point(&marked[0]));
+        assert!(!has_cache_point(&marked[4]));
+
+        // No assistant messages -> untouched.
+        let user_only = vec![text_message(ConversationRole::User, "u1")];
+        let untouched = BedrockProvider::add_message_cache_points(user_only);
+        assert!(!has_cache_point(&untouched[0]));
     }
 
     #[tokio::test]

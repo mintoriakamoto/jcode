@@ -2396,6 +2396,53 @@ fn test_finish_turn_auto_pokes_again_when_todos_remain() {
 }
 
 #[test]
+fn test_auto_poke_disarms_after_stalled_todo_set() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                group: None,
+                id: "todo-1".to_string(),
+                content: "Keep going".to_string(),
+                status: "in_progress".to_string(),
+                priority: "high".to_string(),
+                blocked_by: Vec::new(),
+                assigned_to: None,
+                confidence: None,
+                completion_confidence: None,
+                confidence_history: Vec::new(),
+            }],
+        )
+        .expect("save todos");
+        app.auto_poke_incomplete_todos = true;
+
+        // The identical incomplete set pokes up to the stall budget, then
+        // disarms instead of re-sending the continuation forever.
+        for _ in 0..crate::tui::App::AUTO_POKE_MAX_STALLED_POKES {
+            assert!(
+                app.schedule_auto_poke_followup_if_needed(),
+                "pokes within the stall budget should queue"
+            );
+            app.queued_messages.clear();
+            app.pending_queued_dispatch = false;
+        }
+        assert!(
+            !app.schedule_auto_poke_followup_if_needed(),
+            "exhausted stall budget must stop queueing"
+        );
+        assert!(!app.auto_poke_incomplete_todos, "auto-poke should disarm");
+        assert!(app.display_messages().iter().any(|msg| {
+            msg.content.contains("todo list stopped changing")
+        }));
+
+        // Re-arming resets the streak.
+        super::commands::activate_auto_poke(&mut app);
+        assert!(app.schedule_auto_poke_followup_if_needed());
+    });
+}
+
+#[test]
 fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();

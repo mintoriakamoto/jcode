@@ -178,16 +178,34 @@ pub fn build_chat_messages(
     allow_reasoning: bool,
     include_reasoning_content: bool,
     allow_image_input: bool,
+    cache_system: bool,
 ) -> Vec<Value> {
     // Build messages in OpenAI format
     let mut api_messages = Vec::new();
 
     // Add system message if provided
     if !system.is_empty() {
-        api_messages.push(serde_json::json!({
-            "role": "system",
-            "content": system
-        }));
+        if cache_system {
+            // For cache-capable upstreams (Anthropic-style explicit caching),
+            // the system prompt must be a content-part array so a
+            // cache_control breakpoint can attach to it. A bare-string system
+            // makes the system+tools prefix uncacheable. Gated on the same
+            // per-model cache support check as the message breakpoint, so
+            // strict OpenAI-schema endpoints keep the plain string form.
+            api_messages.push(serde_json::json!({
+                "role": "system",
+                "content": [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }));
+        } else {
+            api_messages.push(serde_json::json!({
+                "role": "system",
+                "content": system
+            }));
+        }
     }
 
     let content_from_parts = |parts: Vec<Value>| -> Option<Value> {
@@ -678,6 +696,28 @@ pub fn build_chat_messages(
     }
 
     api_messages
+}
+
+#[cfg(test)]
+mod build_chat_messages_tests {
+    use super::build_chat_messages;
+
+    #[test]
+    fn system_prompt_gets_cache_control_only_when_cache_supported() {
+        let cached = build_chat_messages(&[], "sys prompt", true, false, false, true);
+        assert_eq!(cached[0]["role"], "system");
+        assert_eq!(cached[0]["content"][0]["type"], "text");
+        assert_eq!(cached[0]["content"][0]["text"], "sys prompt");
+        assert_eq!(
+            cached[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // Strict OpenAI-schema endpoints must keep the plain string form.
+        let plain = build_chat_messages(&[], "sys prompt", true, false, false, false);
+        assert_eq!(plain[0]["role"], "system");
+        assert_eq!(plain[0]["content"], "sys prompt");
+    }
 }
 
 #[cfg(test)]

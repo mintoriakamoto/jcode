@@ -42,6 +42,11 @@ pub use jcode_compaction_core::{
 
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
 const HARD_THRESHOLD_PENDING_POLL_MS: u64 = 50;
+/// Response budget for a compaction summary. The sidecar default (1024) is
+/// sized for short memory judgments; summaries of near-full-context sessions
+/// need more headroom, and `build_compaction_prompt` already reserves ~4000
+/// tokens of the window for output.
+const COMPACTION_SUMMARY_MAX_TOKENS: u32 = 4096;
 
 /// Result from background compaction task
 struct CompactionResult {
@@ -1732,14 +1737,45 @@ async fn generate_compaction_artifact(
 
     let max_prompt_chars = provider.context_window().saturating_sub(4000) * CHARS_PER_TOKEN;
     let prompt = build_compaction_prompt(&messages, existing_summary.as_ref(), max_prompt_chars);
+    let summary_system = "You are a helpful assistant that summarizes conversations.";
+
+    // The summary call is near-full-context and its only output is a summary,
+    // so prefer the dedicated fast/cheap sidecar model over the session model.
+    // Any failure (no cheap credentials, prompt too large for the sidecar
+    // model's window, transient error) falls back to the session provider, so
+    // compaction itself never regresses.
+    let sidecar = crate::sidecar::Sidecar::new().with_max_tokens(COMPACTION_SUMMARY_MAX_TOKENS);
+    if sidecar.has_dedicated_cheap_backend() {
+        match sidecar.complete(summary_system, &prompt).await {
+            Ok(summary) if !summary.trim().is_empty() => {
+                crate::logging::info(&format!(
+                    "[compaction] summary generated via {} sidecar ({})",
+                    sidecar.backend_name(),
+                    sidecar.model_name(),
+                ));
+                return Ok(CompactionResult {
+                    summary_text: summary,
+                    openai_encrypted_content: None,
+                    covers_up_to_turn: messages.len(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    summarized_messages: messages.len(),
+                });
+            }
+            Ok(_) => {
+                crate::logging::warn(
+                    "[compaction] sidecar summary came back empty; falling back to session model",
+                );
+            }
+            Err(err) => {
+                crate::logging::warn(&format!(
+                    "[compaction] sidecar summary failed ({err:#}); falling back to session model",
+                ));
+            }
+        }
+    }
 
     // Generate summary using simple completion
-    let summary = provider
-        .complete_simple(
-            &prompt,
-            "You are a helpful assistant that summarizes conversations.",
-        )
-        .await?;
+    let summary = provider.complete_simple(&prompt, summary_system).await?;
 
     Ok(CompactionResult {
         summary_text: summary,

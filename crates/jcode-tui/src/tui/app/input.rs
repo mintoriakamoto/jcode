@@ -1591,6 +1591,41 @@ impl App {
             return false;
         }
 
+        // The incomplete-todo poke needs its own progress-keyed budget: while
+        // the model is completing todos each poke is productive, but once the
+        // set stops changing, every further poke is the same full-context
+        // continuation re-sent on each turn end.
+        let fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for todo in &incomplete {
+                todo.id.hash(&mut hasher);
+                todo.status.hash(&mut hasher);
+                todo.content.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+        if self.auto_poke_last_fingerprint == Some(fingerprint) {
+            self.auto_poke_stalled_pokes = self.auto_poke_stalled_pokes.saturating_add(1);
+        } else {
+            self.auto_poke_last_fingerprint = Some(fingerprint);
+            self.auto_poke_stalled_pokes = 0;
+        }
+        if self.auto_poke_stalled_pokes >= Self::AUTO_POKE_MAX_STALLED_POKES {
+            crate::logging::warn(&format!(
+                "AUTO_POKE_DECISION action=disarm reason=stalled pokes={} incomplete={}",
+                self.auto_poke_stalled_pokes,
+                incomplete.len()
+            ));
+            self.push_display_message(DisplayMessage::system(
+                "⚠️ We poked the agent several times but the todo list stopped changing. We stopped poking; review the remaining todos yourself. /poke to re-arm.",
+            ));
+            self.auto_poke_incomplete_todos = false;
+            self.auto_poke_last_fingerprint = None;
+            self.auto_poke_stalled_pokes = 0;
+            return false;
+        }
+
         self.push_display_message(DisplayMessage::system(format!(
             "👉 {} incomplete todo{}. We poked it for you. /poke off to stop.",
             incomplete.len(),

@@ -109,6 +109,8 @@ pub(super) fn disable_auto_poke(app: &mut App) -> usize {
     app.todo_confidence_spike_challenged = false;
     app.todo_completion_gate_attempts = 0;
     app.todo_gate_digest_delivered = false;
+    app.auto_poke_last_fingerprint = None;
+    app.auto_poke_stalled_pokes = 0;
     cleared
 }
 
@@ -237,6 +239,8 @@ pub(super) fn activate_auto_poke(app: &mut App) -> PokeActivation {
     app.auto_poke_incomplete_todos = true;
     app.todo_confidence_spike_challenged = false;
     app.todo_completion_gate_attempts = 0;
+    app.auto_poke_last_fingerprint = None;
+    app.auto_poke_stalled_pokes = 0;
     // Re-arming starts a fresh review cycle, so the deferred quality digest is
     // eligible to be delivered again for the upcoming work.
     app.todo_gate_digest_delivered = false;

@@ -1,7 +1,7 @@
 {
-  "total": 3226,
+  "total": 3228,
   "totals_by_pattern": {
-    "dot_ok": 1184,
+    "dot_ok": 1186,
     "let_underscore": 1189,
     "unwrap_or_default": 853
   },
@@ -622,7 +622,7 @@
       "unwrap_or_default": 0
     },
     "crates/jcode-base/src/auth/mod.rs": {
-      "dot_ok": 4,
+      "dot_ok": 5,
       "let_underscore": 0,
       "unwrap_or_default": 4
     },
@@ -1492,7 +1492,7 @@
       "unwrap_or_default": 0
     },
     "crates/jcode-provider-bedrock/src/lib.rs": {
-      "dot_ok": 18,
+      "dot_ok": 19,
       "let_underscore": 9,
       "unwrap_or_default": 5
     },

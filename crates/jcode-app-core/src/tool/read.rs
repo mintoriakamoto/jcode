@@ -11,6 +11,14 @@ use std::path::Path;
 
 const DEFAULT_LIMIT: usize = 5000;
 const MAX_LINE_LEN: usize = 2000;
+/// Total output cap. Every other tool bounds its output (bash 30k chars,
+/// webfetch 40k), but read's line limits alone admitted up to 10 MB — a
+/// single minified bundle could eat a third of the context window before the
+/// 30%-of-budget backstop tripped. ~120k chars is roughly 30k tokens: large
+/// enough for multi-thousand-line source files, small enough that one read
+/// cannot dominate the conversation. The continuation hint keeps the rest
+/// reachable.
+const MAX_TOTAL_CHARS: usize = 120_000;
 
 pub struct ReadTool;
 
@@ -44,16 +52,6 @@ struct NormalizedReadRange {
     offset: usize,
     limit: usize,
     style: ReadRangeStyle,
-}
-
-impl NormalizedReadRange {
-    fn next_offset(self) -> usize {
-        self.offset + self.limit
-    }
-
-    fn next_start_line(self) -> usize {
-        self.next_offset() + 1
-    }
 }
 
 fn normalize_read_range(params: &ReadInput) -> Result<NormalizedReadRange> {
@@ -194,6 +192,8 @@ impl Tool for ReadTool {
         let mut output = String::with_capacity(range.limit.min(2000) * 80);
         let mut total_lines = 0usize;
         let mut truncated_line_count = 0usize;
+        let mut char_capped = false;
+        let mut last_emitted_line = 0usize;
         let end_exclusive = range.offset + range.limit;
         {
             use std::fmt::Write;
@@ -204,6 +204,11 @@ impl Tool for ReadTool {
                 }
                 if i >= end_exclusive {
                     // Still need to count remaining lines
+                    continue;
+                }
+                if output.len() >= MAX_TOTAL_CHARS {
+                    // Keep counting remaining lines for the continuation hint.
+                    char_capped = true;
                     continue;
                 }
                 let line_num = i + 1;
@@ -218,10 +223,15 @@ impl Tool for ReadTool {
                 } else {
                     let _ = writeln!(output, "{:>5}\t{}", line_num, line);
                 }
+                last_emitted_line = line_num;
             }
         }
 
-        let end = end_exclusive.min(total_lines);
+        let end = if char_capped {
+            last_emitted_line
+        } else {
+            end_exclusive.min(total_lines)
+        };
 
         // Publish file touch event for swarm coordination
         Bus::global().publish(BusEvent::FileTouch(FileTouch {
@@ -253,13 +263,23 @@ impl Tool for ReadTool {
 
         // Add metadata
         if end < total_lines {
+            // `end` is the last emitted 1-based line, so the next unread line
+            // is 0-based offset `end` / 1-based start_line `end + 1`. When the
+            // char cap tripped this points mid-range; otherwise it matches the
+            // requested range end.
             let continuation_hint = match range.style {
-                ReadRangeStyle::OffsetLimit => format!("offset={}", range.next_offset()),
-                ReadRangeStyle::StartEnd => format!("start_line={}", range.next_start_line()),
+                ReadRangeStyle::OffsetLimit => format!("offset={}", end),
+                ReadRangeStyle::StartEnd => format!("start_line={}", end + 1),
+            };
+            let cap_note = if char_capped {
+                format!(" — output capped at ~{} chars", MAX_TOTAL_CHARS)
+            } else {
+                String::new()
             };
             output.push_str(&format!(
-                "\n... {} more lines (use {} to continue)\n",
+                "\n... {} more lines{} (use {} to continue)\n",
                 total_lines - end,
+                cap_note,
                 continuation_hint
             ));
         }

@@ -30,6 +30,9 @@ concurrency:
 jobs:
   smoke:
     name: FreeBSD Smoke (x86_64)
+    # The weekly cron otherwise runs the full 2-hour QEMU build on every fork
+    # indefinitely; manual dispatch and workflow-file pushes still work there.
+    if: github.event_name != 'schedule' || github.repository == '1jehuang/jcode'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
