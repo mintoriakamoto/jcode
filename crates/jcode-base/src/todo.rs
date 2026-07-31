@@ -11,11 +11,10 @@ pub use jcode_task_types::{
 /// not provide enough evidence to clear their respective quality gate.
 pub const QUALITY_GATE_THRESHOLD: u8 = 96;
 
-/// Goals with a hill-climbability score strictly below this are considered
-/// low: no credible metric to iterate against. The todo tool nudges the model
-/// on every applicable write to reframe the objective into something
-/// quantifiable and verifiable.
-pub const LOW_HILL_CLIMBABILITY: u8 = QUALITY_GATE_THRESHOLD;
+/// Goals whose closed-feedback-loop score is strictly below this are considered
+/// open-loop: no observation reports back whether the work satisfies the
+/// requirements, so there is nothing credible to iterate against.
+pub const LOW_CLOSED_FEEDBACK_LOOP: u8 = QUALITY_GATE_THRESHOLD;
 
 /// Below this score the agent does not yet understand the user's intent well
 /// enough to work confidently against it.
@@ -27,11 +26,16 @@ const LEGACY_TODO_ALIGNMENT_CONTINUATION_MESSAGE: &str = "Your alignment score i
 
 /// Model-facing continuation for the private intent-understanding check.
 /// Deliberately small: think more about the user's intent, do not ask the user.
-pub const TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str = "Your understanding of the user's intent is not high enough. Re-read the request and think harder about what the user actually wants and left implicit, using the conversation and codebase as evidence. Do not ask the user; resolve the ambiguity yourself, then update the plan's user intention and understands_user_intent.";
+pub const TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str = "Your understanding of the user's intent is not high enough. Re-read the request and think harder about what the user actually wants and left implicit, using the conversation and codebase as evidence. Form a requirement inventory covering outcomes, deliverables, constraints, prohibited actions, integration paths, edge cases, and necessary follow-through, and check the plan represents every material item. Do not ask the user; resolve the ambiguity yourself, then update the plan's user intention and understands_user_intent.";
 
-/// Model-facing continuation for the private hill-climbability check. Names the
-/// assessment category without disclosing the score or threshold.
-pub const TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE: &str = "Your hill-climbability is not high enough. First, improve the goal's objective and feedback loop so progress can be measured across iterations. Then call the todo tool again with the revised goal before continuing the task. The goal is to create a strong feedback loop you can iterate against.";
+/// Model-facing continuation for the private closed-feedback-loop check. Names
+/// the assessment category without disclosing the score or threshold.
+pub const TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE: &str = "Your feedback loop is not closed. First, improve the goal's objective and name the observation that reports back on each requirement, so progress can be measured across iterations. Generic phrases such as run tests, verify, or review count only for requirements those named checks demonstrably enforce; add separate explicit checks for non-testable requirements. Then call the todo tool again with the revised goal before continuing the task. The goal is to create a strong feedback loop you can iterate against.";
+
+/// Pre-rename ("hill-climbability") version of the closed-feedback-loop
+/// continuation. Kept only so persisted transcripts still classify it as a
+/// synthetic gate message rather than a user turn.
+const LEGACY_TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE: &str = "Your hill-climbability is not high enough. First, improve the goal's objective and feedback loop so progress can be measured across iterations. Then call the todo tool again with the revised goal before continuing the task. The goal is to create a strong feedback loop you can iterate against.";
 
 /// Model-facing continuation for the private end-to-end ownership check. Names
 /// the assessment category without disclosing the score or threshold.
@@ -61,7 +65,7 @@ pub const SEVERE_INTENT_MISUNDERSTANDING: u8 = 60;
 #[serde(rename_all = "snake_case")]
 pub enum GateObservationKind {
     IntentUnderstanding,
-    HillClimbability,
+    ClosedFeedbackLoop,
 }
 
 /// A point during the turn that would previously have interrupted the model
@@ -90,7 +94,13 @@ pub struct GateObservation {
 /// replanning. Names categories without disclosing scores or thresholds.
 pub const TODO_GATE_DIGEST_PREFIX: &str = "[automated todo quality review - not a user message] Before you treat this turn as finished, double-check the weak points it surfaced. Do not reply conversationally or wait for the user.";
 
-fn observation_is_resolved(
+/// Whether the score behind this observation has since reached its threshold.
+///
+/// This no longer suppresses the observation: a loop that closed only after
+/// work was already underway did not govern the work done before it. It selects
+/// the wording instead, so a late climb is described as a coverage gap rather
+/// than as a goal that never had a loop at all.
+fn observation_score_later_cleared(
     observation: &GateObservation,
     plan: &TodoPlan,
     goals: &[TodoGoal],
@@ -99,59 +109,74 @@ fn observation_is_resolved(
         GateObservationKind::IntentUnderstanding => plan
             .understands_user_intent
             .is_some_and(|score| score >= LOW_INTENT_UNDERSTANDING),
-        GateObservationKind::HillClimbability => goals
+        GateObservationKind::ClosedFeedbackLoop => goals
             .iter()
             .find(|goal| normalized_group(goal.group.as_deref()) == observation.group)
-            .and_then(|goal| goal.hill_climbability)
-            .is_some_and(|score| score >= LOW_HILL_CLIMBABILITY),
+            .and_then(|goal| goal.closed_feedback_loop)
+            .is_some_and(|score| score >= LOW_CLOSED_FEEDBACK_LOOP),
     }
 }
 
 /// Build the turn-end reminder from this turn's recorded observations.
 ///
-/// Observations whose score has since cleared its threshold are dropped, which
-/// is the mechanism that makes deferral cheaper than gating: an agent whose
-/// understanding rose from 70 to 97 while reading the codebase is never told
-/// anything. Repeats of the same point collapse into one line with a count, so
-/// a long iterative turn cannot generate a wall of duplicates. Returns `None`
-/// when nothing is left to say.
+/// Every point recorded during the turn is surfaced, including ones whose score
+/// later rose past the threshold. A late climb is exactly the case worth
+/// raising: if the goal had no measurable loop while the work was being done,
+/// that work never benefited from the better loop the agent eventually wrote
+/// down, so the score reads as passing while the result behind it is unchecked.
+/// The score still decides the wording, so a late climb is asked to extend its
+/// loop back over the earlier work rather than being told it has no loop.
+///
+/// Repeats of the same point collapse into one line with a count, so a long
+/// iterative turn cannot generate a wall of duplicates. Returns `None` when
+/// nothing was recorded.
 pub fn build_gate_digest(
     observations: &[GateObservation],
     plan: &TodoPlan,
     goals: &[TodoGoal],
 ) -> Option<String> {
-    let mut unresolved: Vec<(GateObservationKind, Option<String>, usize)> = Vec::new();
+    // (kind, group, times flagged, score later cleared)
+    let mut points: Vec<(GateObservationKind, Option<String>, usize, bool)> = Vec::new();
     for observation in observations {
-        if observation_is_resolved(observation, plan, goals) {
-            continue;
-        }
-        match unresolved
+        let cleared = observation_score_later_cleared(observation, plan, goals);
+        match points
             .iter_mut()
-            .find(|(kind, group, _)| *kind == observation.kind && *group == observation.group)
+            .find(|(kind, group, _, _)| *kind == observation.kind && *group == observation.group)
         {
-            Some((_, _, count)) => *count += 1,
-            None => unresolved.push((observation.kind, observation.group.clone(), 1)),
+            Some((_, _, count, _)) => *count += 1,
+            None => points.push((observation.kind, observation.group.clone(), 1, cleared)),
         }
     }
-    if unresolved.is_empty() {
+    if points.is_empty() {
         return None;
     }
 
-    let resolved_count =
-        observations.len() - unresolved.iter().map(|(_, _, count)| *count).sum::<usize>();
     let mut message = String::from(TODO_GATE_DIGEST_PREFIX);
-    for (kind, group, count) in &unresolved {
-        let detail = match kind {
-            GateObservationKind::IntentUnderstanding => {
+    for (kind, group, count, cleared) in &points {
+        let detail = match (kind, cleared) {
+            (GateObservationKind::IntentUnderstanding, false) => {
                 "your understanding of what the user actually wants never became solid. Re-read the request, confirm the work you did matches it, and state any interpretation you had to guess at.".to_string()
             }
-            GateObservationKind::HillClimbability => {
+            (GateObservationKind::IntentUnderstanding, true) => {
+                "you started this work without understanding what the user actually wants, and only settled it later. Re-check the work you did before it settled against the request you now understand, and state any interpretation you had to guess at.".to_string()
+            }
+            (GateObservationKind::ClosedFeedbackLoop, false) => {
                 let label = group
                     .as_deref()
                     .map(|group| format!(" for \"{}\"", group))
                     .unwrap_or_default();
                 format!(
-                    "the goal{} never had a feedback loop you could measure progress against. Confirm the result is actually better, with concrete evidence rather than inspection.",
+                    "the goal{} never closed its feedback loop: no observation reported back on whether the work satisfied the requirements. Confirm the result is actually better, with concrete evidence rather than inspection.",
+                    label
+                )
+            }
+            (GateObservationKind::ClosedFeedbackLoop, true) => {
+                let label = group
+                    .as_deref()
+                    .map(|group| format!(" for \"{}\"", group))
+                    .unwrap_or_default();
+                format!(
+                    "the goal{} was worked on before its feedback loop was closed, so the loop you ended up with never ran over that earlier work. Run it over the whole result now and report what it actually reported back.",
                     label
                 )
             }
@@ -162,13 +187,6 @@ pub fn build_gate_digest(
             String::new()
         };
         message.push_str(&format!("\n- {}{}", detail, repeats));
-    }
-    if resolved_count > 0 {
-        message.push_str(&format!(
-            "\n{} other point{} resolved on their own as the work progressed; no action needed there.",
-            resolved_count,
-            if resolved_count == 1 { "" } else { "s" }
-        ));
     }
     message.push_str(
         "\nAddress the points above, then update the todo tool with the assessments that reflect what you verified.",
@@ -228,6 +246,29 @@ pub fn newly_completed_groups_have_sufficient_ownership(
     })
 }
 
+/// Groups that this update closes: complete in `incoming`, not complete before.
+///
+/// Quality checks need these as well as the still-open groups. A turn that
+/// creates and finishes a group in a single write would otherwise record no
+/// observation at all, and the weakest goals are exactly the ones most likely to
+/// be declared done in one step.
+pub fn groups_closed_by_update(
+    previous: &[TodoItem],
+    incoming: &[TodoItem],
+) -> Vec<Option<String>> {
+    let mut groups: Vec<Option<String>> = Vec::new();
+    for todo in incoming {
+        let group = normalized_group(todo.group.as_deref());
+        if groups.contains(&group) {
+            continue;
+        }
+        if group_is_complete(incoming, &group) && !group_is_complete(previous, &group) {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
 /// Completed todos whose final confidence increase was abrupt rather than
 /// accumulated in smaller evidence-backed steps. Older todo records may not
 /// have a history, so they fall back to comparing planning and completion
@@ -261,6 +302,91 @@ pub fn build_auto_poke_message(incomplete_count: usize) -> String {
     )
 }
 
+/// Longest list of named todos a gate continuation will spell out, so a big
+/// plan cannot turn one nudge into a wall of text.
+const GATE_NAMED_TODO_LIMIT: usize = 6;
+
+fn quoted_todo_label(todo: &TodoItem) -> String {
+    let content = todo.content.trim();
+    let label: String = if content.chars().count() > 80 {
+        format!("{}…", content.chars().take(79).collect::<String>())
+    } else {
+        content.to_string()
+    };
+    format!("\"{}\"", label)
+}
+
+fn append_named_todos(message: &mut String, lead: &str, todos: &[&TodoItem]) {
+    if todos.is_empty() {
+        return;
+    }
+    message.push_str("\n- ");
+    message.push_str(lead);
+    message.push(' ');
+    let named: Vec<String> = todos
+        .iter()
+        .take(GATE_NAMED_TODO_LIMIT)
+        .map(|todo| quoted_todo_label(todo))
+        .collect();
+    message.push_str(&named.join(", "));
+    if todos.len() > named.len() {
+        message.push_str(&format!(" (and {} more)", todos.len() - named.len()));
+    }
+    message.push('.');
+}
+
+/// Completion-gate continuation naming exactly which completed todos failed the
+/// check, so the model re-validates those items instead of guessing which part
+/// of its work was doubted. Scores and thresholds stay private; only the reason
+/// category per todo is disclosed.
+pub fn build_todo_completion_continuation_message(todos: &[TodoItem]) -> String {
+    let completed: Vec<&TodoItem> = todos
+        .iter()
+        .filter(|todo| todo.status == "completed")
+        .collect();
+    let missing: Vec<&TodoItem> = completed
+        .iter()
+        .copied()
+        .filter(|todo| todo.completion_confidence.is_none())
+        .collect();
+    let weak: Vec<&TodoItem> = completed
+        .iter()
+        .copied()
+        .filter(|todo| {
+            todo.completion_confidence
+                .is_some_and(|score| score < QUALITY_GATE_THRESHOLD)
+        })
+        .collect();
+
+    let mut message = String::from(TODO_COMPLETION_CONTINUATION_MESSAGE);
+    if missing.is_empty() && weak.is_empty() {
+        message.push_str(
+            "\n- Taken together the completed work is not validated strongly enough yet: re-verify the finished todos with concrete evidence.",
+        );
+        return message;
+    }
+    append_named_todos(
+        &mut message,
+        "No completion_confidence was recorded for:",
+        &missing,
+    );
+    append_named_todos(
+        &mut message,
+        "The recorded completion_confidence is not strong enough for:",
+        &weak,
+    );
+    message
+}
+
+/// Spike-gate continuation naming the completed todos whose confidence jumped,
+/// so the recheck targets those items.
+pub fn build_todo_confidence_spike_continuation_message(todos: &[TodoItem]) -> String {
+    let spiked = spike_completed_todos(todos);
+    let mut message = String::from(TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE);
+    append_named_todos(&mut message, "Recheck the confidence jump on:", &spiked);
+    message
+}
+
 /// True when `message` is a synthetic auto-poke continuation (the
 /// incomplete-todos poke or the todo confidence summary) rather than a real
 /// user prompt.
@@ -275,7 +401,8 @@ pub fn is_auto_poke_message(message: &str) -> bool {
     (trimmed.starts_with("You have ")
         && trimmed.contains(" incomplete todo")
         && trimmed.ends_with("update the todo tool."))
-        || trimmed.starts_with(TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(LEGACY_TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE)
         || trimmed.starts_with(LEGACY_TODO_ALIGNMENT_CONTINUATION_MESSAGE)
         || trimmed.starts_with(TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE)
         || trimmed.starts_with(TODO_OWNERSHIP_CONTINUATION_MESSAGE)
@@ -285,6 +412,48 @@ pub fn is_auto_poke_message(message: &str) -> bool {
         || trimmed.starts_with(LEGACY_TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE)
         || trimmed.starts_with(LEGACY_TODO_CONFIDENCE_SUMMARY_PREFIX)
         || trimmed.starts_with(TODO_GATE_DIGEST_PREFIX)
+}
+
+/// Short, user-facing stand-in for a synthetic auto-poke/gate continuation.
+///
+/// The continuations themselves are written for the model and name specific
+/// todos and required fields. Showing that wall of instructions in the
+/// transcript (on reload/resume, where the live short notice is gone) buries the
+/// conversation, so the UI renders this one-liner instead.
+pub fn auto_poke_display_summary(message: &str) -> Option<&'static str> {
+    let trimmed = message.trim();
+    if !is_auto_poke_message(trimmed) {
+        return None;
+    }
+    if trimmed.starts_with(TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(LEGACY_TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE)
+    {
+        return Some("🔍 Double-checking a confidence jump for you...");
+    }
+    if trimmed.starts_with(TODO_COMPLETION_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(LEGACY_TODO_COMPLETION_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(LEGACY_TODO_CONFIDENCE_SUMMARY_PREFIX)
+    {
+        return Some("🔍 Double-checking confidence for you...");
+    }
+    if trimmed.starts_with(TODO_GATE_DIGEST_PREFIX) {
+        return Some("🔍 Reviewing the weak points of this turn for you...");
+    }
+    if trimmed.starts_with(TODO_OWNERSHIP_CONTINUATION_MESSAGE) {
+        return Some("🔍 Checking the full outcome was owned end to end...");
+    }
+    if trimmed.starts_with(TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE) {
+        return Some("🔍 Re-checking the request was understood...");
+    }
+    if trimmed.starts_with(TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(LEGACY_TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(LEGACY_TODO_ALIGNMENT_CONTINUATION_MESSAGE)
+    {
+        return Some("🔍 Asking for a stronger way to verify this work...");
+    }
+    // Incomplete-todos poke: the count is genuinely useful, and it is already
+    // short, so it keeps its own text.
+    None
 }
 
 pub fn load_todos(session_id: &str) -> Result<Vec<TodoItem>> {
@@ -464,31 +633,69 @@ mod tests {
         }
     }
 
-    fn hill_observation(group: Option<&str>, score: Option<u8>) -> GateObservation {
+    fn loop_observation(group: Option<&str>, score: Option<u8>) -> GateObservation {
         GateObservation {
-            kind: GateObservationKind::HillClimbability,
+            kind: GateObservationKind::ClosedFeedbackLoop,
             group: group.map(str::to_string),
             score,
         }
     }
 
-    /// The point of deferring: understanding of a request starts low and rises
-    /// as the agent explores, so a flag raised early must vanish once the score
-    /// has cleared by turn end. This is the case that used to generate a nudge
-    /// on every single write.
+    /// A score that climbed only after work was underway still gets raised, and
+    /// is described as the coverage gap it is. Suppressing it would let an agent
+    /// clear the gate by writing a good assessment at the end, after the work it
+    /// was supposed to govern was already done and booked.
     #[test]
-    fn digest_drops_points_that_resolved_during_the_turn() {
+    fn digest_still_raises_a_point_whose_score_climbed_late() {
         let observations = vec![
             intent_observation(Some(70)),
             intent_observation(Some(80)),
             intent_observation(Some(92)),
         ];
-        let resolved = TodoPlan {
+        let climbed = TodoPlan {
             understands_user_intent: Some(QUALITY_GATE_THRESHOLD),
             understands_user_intent_history: vec![70, 80, 92, QUALITY_GATE_THRESHOLD],
             ..Default::default()
         };
-        assert_eq!(build_gate_digest(&observations, &resolved, &[]), None);
+        let digest = build_gate_digest(&observations, &climbed, &[])
+            .expect("a late climb must still be raised, not silently dropped");
+        assert_eq!(digest.matches("\n- ").count(), 1);
+        // Worded as "you started without understanding", not "you never
+        // understood": the latter would contradict the passing final score and
+        // invite the model to argue with the reminder instead of acting on it.
+        assert!(digest.contains("started this work without understanding"));
+        assert!(digest.contains("(flagged 3 times this turn)"));
+        assert!(!digest.contains("never became solid"));
+        assert!(!digest.contains(&QUALITY_GATE_THRESHOLD.to_string()));
+    }
+
+    /// The late-climb wording is per point, so one turn can carry both a goal
+    /// that closed its loop late and a goal that never closed one at all.
+    #[test]
+    fn digest_words_late_climbs_and_never_closed_goals_differently() {
+        let observations = vec![
+            loop_observation(Some("closed late"), Some(50)),
+            loop_observation(Some("never closed"), Some(50)),
+        ];
+        let goals = vec![
+            TodoGoal {
+                group: Some("closed late".to_string()),
+                closed_feedback_loop: Some(QUALITY_GATE_THRESHOLD),
+                ..Default::default()
+            },
+            TodoGoal {
+                group: Some("never closed".to_string()),
+                closed_feedback_loop: Some(50),
+                ..Default::default()
+            },
+        ];
+        let digest = build_gate_digest(&observations, &TodoPlan::default(), &goals)
+            .expect("both goals should be surfaced");
+        assert_eq!(digest.matches("\n- ").count(), 2);
+        assert!(digest.contains(
+            "the goal for \"closed late\" was worked on before its feedback loop was closed"
+        ));
+        assert!(digest.contains("the goal for \"never closed\" never closed its feedback loop"));
     }
 
     #[test]
@@ -516,11 +723,11 @@ mod tests {
     #[test]
     fn digest_collapses_repeats_and_counts_them() {
         let observations: Vec<GateObservation> = (0..9)
-            .map(|_| hill_observation(Some("utf16 transcode"), Some(84)))
+            .map(|_| loop_observation(Some("utf16 transcode"), Some(84)))
             .collect();
         let goals = vec![TodoGoal {
             group: Some("utf16 transcode".to_string()),
-            hill_climbability: Some(84),
+            closed_feedback_loop: Some(84),
             ..Default::default()
         }];
         let digest = build_gate_digest(&observations, &TodoPlan::default(), &goals)
@@ -534,31 +741,34 @@ mod tests {
         assert!(digest.contains("utf16 transcode"));
     }
 
+    /// Each goal gets its own line, named by group, so a multi-goal turn does
+    /// not blur two different problems into one instruction.
     #[test]
-    fn digest_separates_goals_and_notes_resolved_points() {
+    fn digest_separates_goals_by_group() {
         let observations = vec![
-            hill_observation(Some("measured"), Some(50)),
-            hill_observation(Some("unmeasured"), Some(50)),
-            hill_observation(Some("unmeasured"), Some(55)),
+            loop_observation(Some("transcode"), Some(50)),
+            loop_observation(Some("render"), Some(50)),
+            loop_observation(Some("render"), Some(55)),
         ];
         let goals = vec![
             TodoGoal {
-                group: Some("measured".to_string()),
-                hill_climbability: Some(QUALITY_GATE_THRESHOLD),
+                group: Some("transcode".to_string()),
+                closed_feedback_loop: Some(50),
                 ..Default::default()
             },
             TodoGoal {
-                group: Some("unmeasured".to_string()),
-                hill_climbability: Some(55),
+                group: Some("render".to_string()),
+                closed_feedback_loop: Some(55),
                 ..Default::default()
             },
         ];
         let digest = build_gate_digest(&observations, &TodoPlan::default(), &goals)
-            .expect("the unmeasured goal should be surfaced");
-        assert_eq!(digest.matches("\n- ").count(), 1);
-        assert!(digest.contains("unmeasured"));
-        assert!(!digest.contains("\"measured\""));
-        assert!(digest.contains("1 other point resolved on their own"));
+            .expect("both goals should be surfaced");
+        assert_eq!(digest.matches("\n- ").count(), 2);
+        assert!(digest.contains("transcode"));
+        assert!(digest.contains("render"));
+        // The repeated goal is collapsed and counted, the single one is not.
+        assert!(digest.contains("(flagged 2 times this turn)"));
     }
 
     /// An ungrouped goal has no label to name, so the line must still read
@@ -566,16 +776,16 @@ mod tests {
     #[test]
     fn digest_handles_the_ungrouped_goal() {
         let digest = build_gate_digest(
-            &[hill_observation(None, Some(10))],
+            &[loop_observation(None, Some(10))],
             &TodoPlan::default(),
             &[TodoGoal {
-                hill_climbability: Some(10),
+                closed_feedback_loop: Some(10),
                 ..Default::default()
             }],
         )
         .expect("ungrouped goal should be surfaced");
         assert!(!digest.contains("\"\""));
-        assert!(digest.contains("the goal never had a feedback loop"));
+        assert!(digest.contains("the goal never closed its feedback loop"));
     }
 
     #[test]
@@ -606,7 +816,7 @@ mod tests {
                 .is_empty()
         );
         append_gate_observations(session, &[intent_observation(Some(70))]).expect("append");
-        append_gate_observations(session, &[hill_observation(Some("perf"), Some(80))])
+        append_gate_observations(session, &[loop_observation(Some("perf"), Some(80))])
             .expect("append");
         let stored = load_gate_observations(session).expect("load");
         assert_eq!(stored.len(), 2);
@@ -655,7 +865,7 @@ mod tests {
         assert!(is_auto_poke_message(&build_auto_poke_message(1)));
         assert!(is_auto_poke_message(&build_auto_poke_message(3)));
         assert!(is_auto_poke_message(
-            TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE
+            TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE
         ));
         assert!(is_auto_poke_message(
             LEGACY_TODO_ALIGNMENT_CONTINUATION_MESSAGE
@@ -675,8 +885,8 @@ mod tests {
     fn quality_continuations_are_actionable_without_private_calibration() {
         for (message, category) in [
             (
-                TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE,
-                "hill-climbability",
+                TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE,
+                "feedback loop is not closed",
             ),
             (
                 TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE,
@@ -709,10 +919,14 @@ mod tests {
             }
         }
 
-        assert!(TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE.contains("strong feedback loop"));
-        assert!(TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE.contains("First, improve"));
-        assert!(TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE.contains("call the todo tool again"));
-        assert!(TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE.contains("before continuing the task"));
+        assert!(TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE.contains("strong feedback loop"));
+        assert!(TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE.contains("First, improve"));
+        assert!(
+            TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE.contains("call the todo tool again")
+        );
+        assert!(
+            TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE.contains("before continuing the task")
+        );
         // Deliberately terse: think harder about intent, never block on the user.
         assert!(TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE.contains("think harder"));
         assert!(
@@ -725,6 +939,110 @@ mod tests {
         assert!(TODO_COMPLETION_CONTINUATION_MESSAGE.contains("Validate the completed result"));
         assert!(TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE.contains("concrete evidence"));
         assert!(TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE.contains("rose too sharply"));
+    }
+
+    /// The model must be told which items it should recheck, otherwise the
+    /// nudge is a guess-the-weak-spot puzzle. Scores stay private.
+    #[test]
+    fn completion_continuation_names_the_failing_todos() {
+        let mut missing = todo("write the parser", "completed", None);
+        missing.completion_confidence = None;
+        let mut weak = todo("wire up the CLI flag", "completed", None);
+        weak.completion_confidence = Some(70);
+        let mut strong = todo("rename the module", "completed", None);
+        strong.completion_confidence = Some(99);
+        let open = todo("ship it", "in_progress", None);
+
+        let message =
+            build_todo_completion_continuation_message(&[missing, weak, strong.clone(), open]);
+        assert!(message.starts_with(TODO_COMPLETION_CONTINUATION_MESSAGE));
+        assert!(message.contains("\"write the parser\""));
+        assert!(message.contains("\"wire up the CLI flag\""));
+        // Passing and unfinished todos are not what the gate is asking about.
+        assert!(!message.contains("\"rename the module\""));
+        assert!(!message.contains("\"ship it\""));
+        for disclosure in ["70", "99", "threshold"] {
+            assert!(!message.contains(disclosure), "disclosed {disclosure}");
+        }
+
+        // Only the weighted average failed: no individual item is nameable, so
+        // the fallback still tells the model what to do.
+        let average_only = build_todo_completion_continuation_message(&[strong]);
+        assert!(average_only.starts_with(TODO_COMPLETION_CONTINUATION_MESSAGE));
+        assert!(average_only.contains("re-verify the finished todos"));
+    }
+
+    #[test]
+    fn spike_continuation_names_the_spiked_todos() {
+        let mut spiked = todo("port the tests", "completed", None);
+        spiked.completion_confidence = Some(100);
+        spiked.confidence_history = vec![60, 100];
+        let mut steady = todo("update docs", "completed", None);
+        steady.completion_confidence = Some(99);
+        steady.confidence_history = vec![95, 97, 99];
+
+        let message = build_todo_confidence_spike_continuation_message(&[spiked, steady]);
+        assert!(message.starts_with(TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE));
+        assert!(message.contains("\"port the tests\""));
+        assert!(!message.contains("\"update docs\""));
+    }
+
+    /// A 40-item plan must not turn one gate nudge into a wall of text.
+    #[test]
+    fn completion_continuation_caps_named_todos() {
+        let todos: Vec<TodoItem> = (0..40)
+            .map(|index| {
+                let mut item = todo(&format!("task {index}"), "completed", None);
+                item.completion_confidence = None;
+                item
+            })
+            .collect();
+        let message = build_todo_completion_continuation_message(&todos);
+        assert!(message.contains("\"task 0\""));
+        assert!(!message.contains("\"task 30\""));
+        assert!(message.contains(&format!("(and {} more)", 40 - GATE_NAMED_TODO_LIMIT)));
+    }
+
+    #[test]
+    fn detailed_gate_continuations_are_not_mistaken_for_user_messages() {
+        let mut item = todo("do the thing", "completed", None);
+        item.completion_confidence = Some(50);
+        item.confidence_history = vec![10, 50];
+        let todos = [item];
+        assert!(is_auto_poke_message(
+            &build_todo_completion_continuation_message(&todos)
+        ));
+        assert!(is_auto_poke_message(
+            &build_todo_confidence_spike_continuation_message(&todos)
+        ));
+    }
+
+    /// The transcript must not replay model-facing gate instructions at the
+    /// user; they get a short "we are checking" line instead.
+    #[test]
+    fn gate_continuations_have_short_user_facing_summaries() {
+        let mut item = todo("do the thing", "completed", None);
+        item.completion_confidence = Some(50);
+        item.confidence_history = vec![10, 50];
+        let todos = [item];
+
+        for message in [
+            build_todo_completion_continuation_message(&todos),
+            build_todo_confidence_spike_continuation_message(&todos),
+            TODO_OWNERSHIP_CONTINUATION_MESSAGE.to_string(),
+            TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE.to_string(),
+            TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE.to_string(),
+        ] {
+            let summary = auto_poke_display_summary(&message).expect("summary");
+            assert!(summary.chars().count() < 70, "too long: {summary}");
+            assert!(!summary.contains("do the thing"));
+            assert!(!summary.contains("completion_confidence"));
+        }
+
+        // The incomplete-todos poke is already short and its count is useful.
+        assert!(auto_poke_display_summary(&build_auto_poke_message(3)).is_none());
+        // Real user prompts are never rewritten.
+        assert!(auto_poke_display_summary("fix the login bug").is_none());
     }
 
     #[test]

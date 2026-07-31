@@ -23,7 +23,7 @@ impl Rendered {
     }
 
     /// Render one model at an explicit surface size and scale factor.
-    fn at(model: &Model, width: u32, height: u32, scale: f64) -> Option<Self> {
+    pub(super) fn at(model: &Model, width: u32, height: u32, scale: f64) -> Option<Self> {
         let mut painter = crate::paint::Painter::default();
         let mut scene = Scene::new();
         build_scene(&mut scene, &mut painter, model, (width, height), scale);
@@ -109,7 +109,7 @@ impl Rendered {
     /// drawn. Sampled on a column just inside the right edge of the measure
     /// column, where only the well can ink, so prompt glyphs cannot be
     /// mistaken for the well itself.
-    fn wash_band(&self) -> Option<(f64, f64)> {
+    pub(super) fn wash_band(&self) -> Option<(f64, f64)> {
         // The composer is an outlined field, so it is found by its horizontal
         // border rules rather than by a fill: scan a column just inside the
         // right edge (where only the field's own borders can ink) and take the
@@ -129,7 +129,7 @@ impl Rendered {
     }
 }
 
-fn nodes() -> Vec<(&'static str, Model)> {
+pub(super) fn nodes() -> Vec<(&'static str, Model)> {
     states::names()
         .into_iter()
         .map(|name| (name, states::by_name(name).expect("listed node")))
@@ -199,83 +199,6 @@ fn the_selection_band_lines_up_with_the_selected_glyphs() {
                 "{name}: band ended at {drawn_end}px, expected {expected_end}px"
             );
         }
-    }
-}
-
-/// The input box must be *drawn* on the middle of the window, not merely laid
-/// out there: this catches a renderer that ignores the centred geometry.
-#[test]
-#[ignore = "requires a GPU"]
-fn the_composer_well_is_drawn_on_the_middle_of_the_window() {
-    for (name, model) in nodes() {
-        let Some(r) = Rendered::new(&model) else {
-            return;
-        };
-        let f = r.frame;
-        let Some((top, bottom)) = r.wash_band() else {
-            panic!("{name}: no composer well was drawn");
-        };
-        assert!(
-            (top - f.composer_top).abs() < 2.0 && (bottom - f.composer_bottom).abs() < 2.0,
-            "{name}: the drawn well {top:.1}..{bottom:.1} left its geometry {:.1}..{:.1}",
-            f.composer_top,
-            f.composer_bottom
-        );
-        let center = (top + bottom) / 2.0;
-        assert!(
-            (center - f.height / 2.0).abs() < 2.0,
-            "{name}: the well centre {center:.1} is not the page middle {:.1}",
-            f.height / 2.0
-        );
-    }
-}
-
-#[test]
-#[ignore = "requires a GPU"]
-fn nothing_draws_in_the_gap_above_the_composer() {
-    for (name, model) in nodes() {
-        let Some(r) = Rendered::new(&model) else {
-            eprintln!("skipping {name}: no GPU");
-            return;
-        };
-        let f = r.frame;
-        // The band between the transcript and the well must stay paper:
-        // this is the overlap bug that made long replies collide.
-        let darkest = r.darkest_in(f.left, f.body_bottom + 2.0, f.right, f.composer_top - 2.0);
-        assert!(
-            darkest > 0.9,
-            "{name}: ink ({darkest:.3} luma) in the composer gap"
-        );
-    }
-}
-
-/// The top of the page must be bare paper. The app previously carried a
-/// wordmark, a status caption, a build-identity row, and a rule up there,
-/// which is the clutter this test exists to keep out: any of them reappearing
-/// inks the band above the transcript.
-///
-/// The session strip is the one sanctioned exception, and only when there is
-/// more than one session to move between, so it is excluded by *its own
-/// reserved band* rather than by relaxing the threshold: anything drawn above
-/// the transcript outside that band still fails.
-#[test]
-#[ignore = "requires a GPU"]
-fn the_top_of_the_page_is_clear() {
-    for (name, model) in nodes() {
-        let Some(r) = Rendered::new(&model) else {
-            eprintln!("skipping {name}: no GPU");
-            return;
-        };
-        let f = r.frame;
-        let top = match f.strip() {
-            Some((_, strip_bottom)) => strip_bottom + 1.0,
-            None => 0.0,
-        };
-        let darkest = r.darkest_in(0.0, top, f.width - 1.0, f.body_top - 2.0);
-        assert!(
-            darkest > 0.9,
-            "{name}: ink ({darkest:.3} luma) above the transcript"
-        );
     }
 }
 
@@ -566,9 +489,18 @@ fn the_caret_sits_on_the_cursor_row_when_wrapped() {
 
 /// A node must render identically no matter when it is rendered, or every
 /// pixel test becomes timing-dependent and flaky.
+///
+/// "Identically" allows single least-significant-bit wobble on a handful of
+/// pixels: Vello rasterizes with GPU atomics, whose accumulation order is not
+/// deterministic, and on this class of hardware two renders of the same scene
+/// occasionally disagree by one 8-bit step on one antialiased edge pixel.
+/// That is GPU noise, not a time-dependent frame; a real clock leak (a
+/// spinner frame, a blink phase, a breath) moves whole glyphs and hundreds of
+/// pixels by far more than one step.
 #[test]
 #[ignore = "requires a GPU"]
 fn state_nodes_render_deterministically() {
+    const MAX_WOBBLE_PIXELS: usize = 8;
     for (name, model) in nodes() {
         let Some(first) = Rendered::new(&model) else {
             return;
@@ -577,9 +509,13 @@ fn state_nodes_render_deterministically() {
         let Some(second) = Rendered::new(&model) else {
             return;
         };
+        let pairs = first.pixels.iter().zip(&second.pixels);
+        let wobble = pairs.clone().filter(|(a, b)| a != b).count();
+        let worst = pairs.map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
         assert!(
-            first.pixels == second.pixels,
-            "{name} rendered differently 700ms later (time-dependent frame)"
+            worst <= 1 && wobble <= MAX_WOBBLE_PIXELS,
+            "{name} rendered differently 700ms later (time-dependent frame: \
+             {wobble} bytes changed, worst step {worst})"
         );
     }
 }
@@ -685,45 +621,6 @@ fn the_caret_disappears_on_the_blink_off_phase() {
         darkest > 0.85,
         "something was drawn past the text on the blink off phase ({darkest:.3})"
     );
-}
-
-/// The caret must never escape its well, at any window size.
-#[test]
-#[ignore = "requires a GPU"]
-fn the_caret_stays_inside_the_composer_well() {
-    for (name, model) in nodes() {
-        let Some(r) = Rendered::new(&model) else {
-            return;
-        };
-        let f = r.frame;
-        // Bands immediately above and below the well must stay paper.
-        let above = r.darkest_in(f.left, f.composer_top - 6.0, f.right, f.composer_top - 3.0);
-        assert!(above > 0.9, "{name}: ink just above the composer well");
-        let below = r.darkest_in(
-            f.left,
-            f.composer_bottom + 1.0,
-            f.right,
-            f.footnote_top - 1.0,
-        );
-        assert!(below > 0.9, "{name}: ink between the well and the footnote");
-    }
-}
-
-#[test]
-#[ignore = "requires a GPU"]
-fn margins_stay_empty() {
-    for (name, model) in nodes() {
-        let Some(r) = Rendered::new(&model) else {
-            return;
-        };
-        let f = r.frame;
-        // Nothing may be drawn outside the measure column: proves text is
-        // wrapped to the column and not clipped by the window edge.
-        let left_margin = r.darkest_in(0.0, 0.0, f.left - 3.0, f.height - 1.0);
-        assert!(left_margin > 0.9, "{name}: ink in the left margin");
-        let bottom = r.darkest_in(0.0, f.footnote_bottom + 2.0, f.width - 1.0, f.height - 1.0);
-        assert!(bottom > 0.9, "{name}: ink below the footnote row");
-    }
 }
 
 /// A model that is not attached must still say so somewhere, or a dead
@@ -1147,7 +1044,13 @@ fn a_user_message_reads_as_a_card_rather_than_a_marker() {
 #[test]
 #[ignore = "requires a GPU"]
 fn rich_content_never_inks_the_composer() {
-    for name in ["markdown", "latex", "code_block", "scrolled_back"] {
+    for name in [
+        "markdown",
+        "markdown_structure",
+        "latex",
+        "code_block",
+        "scrolled_back",
+    ] {
         let model = states::by_name(name).expect("node");
         let Some(r) = Rendered::new(&model) else {
             eprintln!("skipping: no GPU");
@@ -1168,51 +1071,39 @@ fn rich_content_never_inks_the_composer() {
     }
 }
 
-/// The activity spinner must actually reach the pixels, in the space the busy
-/// line is indented for. A silent turn was the whole bug this fixes, so an
-/// indicator the renderer forgets to draw is the regression to guard.
+/// The busy line starts at the composer's text margin, with no spinner drawn
+/// before it. The elapsed clock in the line itself is the liveness signal, so
+/// the phase text must reach the pixels right at the margin: a working turn
+/// that renders nothing there looks frozen.
 #[test]
 #[ignore = "requires a GPU"]
-fn the_activity_spinner_is_drawn_beside_the_busy_line() {
+fn the_busy_line_starts_at_the_text_margin_with_no_spinner() {
     let model = states::by_name("working").expect("node");
     let Some(r) = Rendered::new(&model) else {
         return;
     };
     let f = r.frame;
-    let darkest = r.darkest_in(
+    // The phase text starts right at the margin...
+    let darkest_text = r.darkest_in(
+        f.composer_text_left(),
+        f.composer_top + 3.0,
+        f.composer_text_left() + 80.0,
+        f.composer_bottom - 3.0,
+    );
+    assert!(
+        darkest_text < 0.92,
+        "no busy-line ink at the text margin ({darkest_text:.3}), so a working turn looks frozen"
+    );
+    // ...and the band to its left stays clean, or the spinner is back.
+    let darkest_left = r.darkest_in(
+        f.left + 2.0,
+        f.composer_top + 3.0,
         f.composer_text_left() - 1.0,
-        f.composer_top + 3.0,
-        f.composer_text_left() + crate::scene::SPINNER_SIZE,
         f.composer_bottom - 3.0,
     );
     assert!(
-        darkest < 0.92,
-        "no spinner ink beside the busy line ({darkest:.3}), so a working turn looks frozen"
-    );
-}
-
-/// The busy line must be indented clear of the spinner. Without the inset the
-/// phase text would run through the ring and both become unreadable, which is
-/// the failure an ink-anywhere test would happily pass.
-#[test]
-#[ignore = "requires a GPU"]
-fn the_busy_line_is_indented_clear_of_the_spinner() {
-    let model = states::by_name("working").expect("node");
-    let Some(r) = Rendered::new(&model) else {
-        return;
-    };
-    let f = r.frame;
-    // The gap sits between the ring's right edge and the text's left edge.
-    let gap_left = f.composer_text_left() + crate::scene::SPINNER_SIZE + 1.0;
-    let darkest = r.darkest_in(
-        gap_left,
-        f.composer_top + 3.0,
-        gap_left + crate::scene::SPINNER_GAP - 2.0,
-        f.composer_bottom - 3.0,
-    );
-    assert!(
-        darkest > 0.9,
-        "the phase text ran into the spinner ({darkest:.3})"
+        darkest_left > 0.9,
+        "ink before the busy line ({darkest_left:.3}), so the spinner is back"
     );
 }
 

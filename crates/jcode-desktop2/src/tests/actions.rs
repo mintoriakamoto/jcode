@@ -96,8 +96,24 @@ fn ctrl_c_quits_only_when_idle_and_empty() {
 #[test]
 fn editing_chords_reach_the_editor() {
     let mut app = app_with("alpha beta");
+    // Web binding: Ctrl+A selects all rather than jumping the caret home.
     press(&mut app, ch('a'), ModifiersState::CONTROL, None);
-    assert_eq!(app.model.editor.cursor(), 0, "Ctrl+A did not go home");
+    assert_eq!(
+        app.model.editor.selected_text(),
+        Some("alpha beta"),
+        "Ctrl+A did not select all"
+    );
+    press(
+        &mut app,
+        Key::Named(NamedKey::Home),
+        ModifiersState::empty(),
+        None,
+    );
+    assert_eq!(
+        app.model.editor.cursor(),
+        0,
+        "Home did not go to line start"
+    );
     press(&mut app, ch('e'), ModifiersState::CONTROL, None);
     assert_eq!(
         app.model.editor.cursor(),
@@ -126,6 +142,58 @@ fn cut_then_paste_round_trips_through_the_clipboard() {
         app.model.editor.text(),
         "cut me",
         "paste did not restore the cut"
+    );
+}
+
+/// Web Ctrl+C: with something selected it copies, and it must not interrupt a
+/// running turn behind the user's back. Only an unselected Ctrl+C interrupts.
+#[test]
+fn ctrl_c_copies_when_there_is_a_selection_instead_of_interrupting() {
+    let mut app = app_with("copy me");
+    app.model.busy = true;
+    press(&mut app, ch('a'), ModifiersState::CONTROL, None);
+    assert!(press(&mut app, ch('c'), ModifiersState::CONTROL, None));
+    assert!(
+        app.model.busy,
+        "Ctrl+C interrupted while copying a selection"
+    );
+    assert_eq!(
+        app.model.editor.text(),
+        "copy me",
+        "Ctrl+C on a selection must not clear the composer"
+    );
+    // Now with nothing selected it falls back to interrupting.
+    press(
+        &mut app,
+        Key::Named(NamedKey::ArrowRight),
+        ModifiersState::empty(),
+        None,
+    );
+    assert!(press(&mut app, ch('c'), ModifiersState::CONTROL, None));
+    assert!(!app.model.busy, "unselected Ctrl+C did not interrupt");
+}
+
+/// Ctrl+Z then Ctrl+Shift+Z round-trips an edit, as in any browser field.
+#[test]
+fn undo_and_redo_round_trip_through_the_app() {
+    let mut app = app_with("alpha");
+    press(&mut app, ch('x'), ModifiersState::CONTROL, None);
+    assert!(app.model.editor.is_empty());
+    press(&mut app, ch('z'), ModifiersState::CONTROL, None);
+    assert_eq!(
+        app.model.editor.text(),
+        "alpha",
+        "Ctrl+Z did not undo the cut"
+    );
+    press(
+        &mut app,
+        ch('z'),
+        ModifiersState::CONTROL | ModifiersState::SHIFT,
+        None,
+    );
+    assert!(
+        app.model.editor.is_empty(),
+        "Ctrl+Shift+Z did not redo the cut"
     );
 }
 
@@ -686,10 +754,10 @@ fn a_long_line_wraps_into_multiple_rows_and_grows_the_well() {
     let lines = composer_layout(&mut app, &source, single).line_count();
     assert!(lines > 1, "a long line did not wrap");
     let frame = App::frame_for_model((1400, 900), 1.0, &app.model);
-    assert!(
-        frame.composer_top < single.composer_top,
-        "the well did not grow for wrapped rows"
-    );
+    // Height, not an edge: a hero page grows the well downward.
+    let grew =
+        frame.composer_bottom - frame.composer_top > single.composer_bottom - single.composer_top;
+    assert!(grew, "the well did not grow for wrapped rows");
     // Wrapping is a view concern: it must not touch the buffer.
     assert_eq!(app.model.editor.text(), long);
     assert_eq!(app.model.editor.line_count(), 1);
@@ -727,10 +795,10 @@ fn the_composer_frame_follows_the_input_line_count() {
     app.apply(Action::InsertNewline, None);
     app.apply(Action::Insert, Some("two"));
     let double = App::frame_for_model((1400, 900), 1.0, &app.model);
-    assert!(
-        double.composer_top < single.composer_top,
-        "the composer did not grow when a line was added"
-    );
+    // Height, not an edge: a hero page grows the well downward.
+    let grew =
+        double.composer_bottom - double.composer_top > single.composer_bottom - single.composer_top;
+    assert!(grew, "the composer did not grow when a line was added");
 }
 
 #[test]

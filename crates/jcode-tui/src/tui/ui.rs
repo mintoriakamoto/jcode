@@ -1322,7 +1322,8 @@ use frame_metrics::{
 };
 pub(crate) use frame_metrics::{
     DrawCallAttribution, FrameInputAttribution, frame_input_attribution_snapshot,
-    record_draw_call_attribution, set_frame_input_attribution, wall_clock_ms,
+    key_to_paint_debug_json, note_frame_painted, note_key_event_read, record_draw_call_attribution,
+    set_frame_input_attribution, wall_clock_ms,
 };
 pub(crate) use frame_metrics::{
     debug_draw_call_history, debug_flicker_frame_history, debug_slow_frame_history,
@@ -1408,15 +1409,72 @@ pub fn last_layout_snapshot() -> Option<LayoutSnapshot> {
 /// appeared only under parallelism (same root cause as issue #593). Both now
 /// delegate here.
 #[cfg(test)]
-pub(crate) fn render_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn render_state_test_lock() -> RenderStateTestGuard {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    let guard = LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    RENDER_STATE_LOCK_HELD.with(|held| held.set(true));
+    RenderStateTestGuard { _guard: guard }
+}
+
+/// Guard for [`render_state_test_lock`] that also records ownership on this
+/// thread, so a nested `clear_test_render_state_for_tests` can tell it is
+/// already inside the lock instead of deadlocking on it.
+#[cfg(test)]
+pub(crate) struct RenderStateTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for RenderStateTestGuard {
+    fn drop(&mut self) {
+        RENDER_STATE_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
+/// Take the render-state lock unless this thread already holds it.
+///
+/// `clear_test_render_state_for_tests` mutates the same globals the lock
+/// protects, but it is called from both locked contexts (rendering tests) and
+/// unlocked ones (`create_test_app`, used by ~570 tests). Acquiring
+/// unconditionally would deadlock the former; not acquiring at all lets the
+/// latter wipe state from under the former, which is the race behind
+/// jcode-tui's intermittent layout failures.
+///
+/// Tracking ownership per thread lets one function serve both: the outermost
+/// holder owns the guard, and nested calls become no-ops.
+#[cfg(test)]
+fn with_render_state_lock<T>(body: impl FnOnce() -> T) -> T {
+    if render_state_lock_held() {
+        return body();
+    }
+
+    let _guard = render_state_test_lock();
+    body()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread currently holds the render-state lock. Set by
+    /// [`render_state_test_lock`]'s guard so nested clears can detect it.
+    static RENDER_STATE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn render_state_lock_held() -> bool {
+    RENDER_STATE_LOCK_HELD.with(|held| held.get())
 }
 
 #[cfg(test)]
 pub(crate) fn clear_test_render_state_for_tests() {
+    with_render_state_lock(clear_test_render_state_locked)
+}
+
+/// The actual reset, run with the render-state lock held.
+#[cfg(test)]
+fn clear_test_render_state_locked() {
     set_last_max_scroll(0);
     set_pinned_pane_total_lines(0);
     set_last_diff_pane_effective_scroll(0);
@@ -2508,10 +2566,12 @@ pub fn draw(frame: &mut Frame, app: &dyn TuiState) {
         Ok(()) => {}
         Err(payload) => render_recovered_panic_frame(frame, &payload),
     }
-    // Adapt the finished frame for light terminal backgrounds (no-op on dark).
-    // Doing this at the buffer level covers every widget and overlay without
-    // touching individual color call sites.
+    // Adapt the finished frame for light backgrounds, then apply the user's
+    // configured colors, which must not be luminance-flipped. Working at the
+    // buffer level covers every widget and overlay without touching individual
+    // color call sites. See `palette::adapt_buffer_for_palette` for the ordering.
     jcode_tui_style::adapt_buffer_for_theme(frame.buffer_mut());
+    jcode_tui_style::palette::adapt_buffer_for_palette(frame.buffer_mut());
     adapt_buffer_for_emoji_preference(frame.buffer_mut());
     // Cache eviction/clearing can outlive the last visible image. Carry Kitty
     // deletion commands on any completed frame so terminal-side pixel storage
@@ -3406,6 +3466,10 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     // over existing rows (blank space, pinned footer, or the transcript tail)
     // instead of reserving layout height and shoving everything around.
     input_ui::draw_command_suggestions_overlay(frame, app, chunks[7]);
+
+    // Ctrl+R reverse prompt-history search overlay (drawn after the command
+    // palette so it wins when both could be visible).
+    input_ui::draw_prompt_history_search_overlay(frame, app, chunks[7]);
 
     // Observe the rendered messages area for the anchor-stability (smoothness)
     // report. Runs on the final buffer so it sees exactly what the user sees.

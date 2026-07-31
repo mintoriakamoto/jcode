@@ -37,7 +37,7 @@ Events are dual-written to two stores with different jobs:
    identity anchors (`install`, `feedback`), auth/lifecycle events, the
    `daily_active_users` rollup, and a retention-pruned raw tail of the
    high-volume events (see `RETENTION_DAYS`). All the dashboard SQL in this
-   repo (`users.sql`, `dau.sql`, `health.sql`) reads D1.
+   repo (`users.sql`, `dau.sql`, `geo.sql`, `health.sql`) reads D1.
 
 ### D1 size self-defense
 
@@ -130,10 +130,57 @@ npm run migrate:auth-failure-reason
 npm run migrate:web-subscription
 npm run migrate:discovery
 npm run migrate:web-quality
+npm run migrate:model-prices
 
-# Run the health dashboard query
+# Run a dashboard query. These go through scripts/run-dashboard.mjs, which
+# sends the file via `--command` instead of `--file`: wrangler's `--file` path
+# is D1's *import* API and prints only "Rows read / Rows written / Database
+# size", discarding the result set, so these panels used to render no data.
 npm run health
+npm run dau
+npm run users
+npm run token-value
 ```
+
+## Token value dashboard
+
+`npm run token-value` reports the list-price dollar value of the token flow
+through jcode, priced per model rather than with one blended rate. Setup:
+
+```bash
+npm run migrate:model-prices   # creates model_prices (migration 0023)
+npm run sync:model-prices      # fills it from https://models.dev/api.json
+npm run token-value            # daily / per-model / summary panels
+npm run token-value:daily      # just the per-day series, in date order
+```
+
+`npm run token-value:daily` is the plain time series when all you want is
+"dollars per day": one row per day with the tokens, sessions, distinct users,
+and value per user behind it. `usd_per_user` is the figure that stays
+comparable as the fleet grows, since the raw total mostly tracks user count.
+
+`scripts/sync-model-prices.mjs` reads the model labels actually observed in
+telemetry (`events.model_end` on `session_end` rows) and matches each one to a
+models.dev price, normalizing the gateway aliases users produce
+(`cc/claude-opus-5`, `openai/gpt-5.6-sol`, `claude-opus-4-5-20251101`,
+`...-4-8@Anthropic`, `-xhigh` effort suffixes). Re-run it after new models
+appear; it is an idempotent upsert. Current token coverage is ~97%, with the
+remainder being users' private gateway aliases (`my-coding`, `SeaaveyCombo`)
+that cannot be resolved to a public price.
+
+Three things to know before quoting the number:
+
+- **Cache accounting is provider-specific.** OpenAI-compatible APIs report
+  cached tokens as a *subset* of prompt tokens; Anthropic reports them as a
+  disjoint bucket. `model_prices.input_includes_cache_read` drives the
+  correction. Skipping it overcharges OpenAI traffic ~10x, and since cache
+  reads are ~85% of all tokens, that error dominates the total.
+- **It is list price, not spend.** Most traffic runs on subscriptions (Claude
+  Max, ChatGPT Pro, Copilot) or free routes, so read it as "list-price
+  equivalent value of tokens served".
+- **Check `priced_token_pct` / `unpriced_tokens`.** Every panel reports them.
+  If coverage drops, re-run the sync before trusting the dollar figure.
+
 
 ## Event types
 
@@ -215,6 +262,12 @@ The 0018 fields were appended without reordering: `blob18=metric_name`,
 ## Querying Data
 
 ```bash
+# Where are our users? (country only; see migration 0022 and TELEMETRY.md)
+npm run geo   # or: wrangler d1 execute jcode-telemetry --remote --file=geo.sql
+
+# Users by country over the last 30 days, straight from the rollup
+wrangler d1 execute jcode-telemetry --remote --command "SELECT COALESCE(last_country, 'unknown') AS country, COUNT(DISTINCT telemetry_id) AS users FROM daily_active_users WHERE activity_date >= date('now', '-30 days') AND last_is_ci = 0 GROUP BY 1 ORDER BY users DESC LIMIT 25"
+
 # Total installs (raw, and excluding CI runners which mint a fresh id per job)
 wrangler d1 execute jcode-telemetry --command "SELECT COUNT(DISTINCT telemetry_id) AS raw_installs, COUNT(DISTINCT CASE WHEN is_ci = 0 THEN telemetry_id END) AS installs_noci FROM events WHERE event = 'install'"
 

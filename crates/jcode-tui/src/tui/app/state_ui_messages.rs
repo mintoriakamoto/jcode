@@ -27,7 +27,12 @@ fn display_message_from_stored_message(
                 // Synthetic auto-poke continuations are persisted as user
                 // turns for the model but must not display as user prompts.
                 if crate::todo::is_auto_poke_message(&text) {
-                    Some(DisplayMessage::system(text))
+                    // Gate continuations are written for the model; the user
+                    // only needs to know the check happened.
+                    match crate::todo::auto_poke_display_summary(&text) {
+                        Some(summary) => Some(DisplayMessage::system(summary.to_string())),
+                        None => Some(DisplayMessage::system(text)),
+                    }
                 } else {
                     Some(DisplayMessage::user(text))
                 }
@@ -367,6 +372,22 @@ impl App {
             self.display_messages.clear();
             self.bump_display_messages_version();
         }
+    }
+
+    /// View-only clear (Ctrl+L, `/cls`): wipe the rendered transcript while
+    /// keeping provider context, queued messages, and the input draft intact,
+    /// so the model still remembers everything. Contrast with `/clear`
+    /// (`reset_current_session`), which discards context too.
+    pub(super) fn clear_view_keep_context(&mut self) {
+        self.clear_display_messages();
+        // The rendered transcript is gone, so every entry in the
+        // process-global ACTIVE_DIAGRAMS registry is orphaned (same rationale
+        // as reset_current_session; partial-retention paths like /rewind must
+        // NOT do this).
+        crate::tui::mermaid::clear_active_diagrams();
+        self.scroll_offset = 0;
+        self.auto_scroll_paused = false;
+        self.set_status_notice("View cleared (context kept)");
     }
 
     pub(super) fn apply_compacted_history_window(

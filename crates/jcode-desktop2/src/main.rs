@@ -4,30 +4,42 @@
 //! Vello vector rendering, Parley text layout, and a live harness API
 //! connection (via jcode-harness-api-bridge) with a minimal chat loop.
 
+mod ack;
 mod activity;
+mod app_harness;
+mod app_overview;
 mod app_selection;
+mod boot;
 mod capture;
 mod caret;
 mod cli;
 mod clipboard;
 mod donut;
 mod editor;
+mod edits;
+mod frame_meter;
 mod harness;
 mod hints;
 mod input;
 mod keymap;
 mod layout;
+mod mem;
 mod meta;
 mod overview;
 mod paint;
 mod place;
 mod profile;
+mod reasoning;
 mod render;
 mod scene;
+mod scene_overview;
 mod scroll;
+mod scroll_bench;
+mod scroll_profile;
 mod select;
 mod states;
 mod stream;
+mod stream_bench;
 mod strip;
 #[cfg(test)]
 mod tests;
@@ -69,16 +81,28 @@ struct App {
     harness: Option<(Receiver<harness::HarnessUpdate>, Sender<harness::Command>)>,
     /// Latest modifier state; winit reports it separately from key events.
     modifiers: winit::keyboard::ModifiersState,
-    /// When Alt went down with nothing else pressed since, or `None` when Alt
-    /// is up or has already been used as part of a chord. The field opens on
-    /// the keydown; this is what lets a tap shorter than [`ALT_TAP`] take it
-    /// straight back off screen.
-    alt_held_since: Option<std::time::Instant>,
-    /// Whether holding Alt opens the blob-field overview. Off by default: the
-    /// concept is benched in favour of Super+HJKL strip motion, but the code
-    /// and its tests stay live so it can come back as a flag flip rather than
-    /// a revert.
-    alt_overview: bool,
+    /// When Super went down with nothing else pressed since, or `None` when
+    /// Super is up or has already been used as part of a chord. The field
+    /// opens on the keydown; this is what lets a tap shorter than
+    /// [`SUPER_TAP`] take it straight back off screen.
+    super_held_since: Option<std::time::Instant>,
+    /// A Super release that has not been acted on yet, as `(when, was_tap)`.
+    ///
+    /// Key remappers (keyd's `[meta] h = left`, and every "Super+hjkl becomes
+    /// arrows" variant) implement the rewrite by *lifting* Super, sending the
+    /// arrow, and pressing Super again. The compositor forwards that faithfully,
+    /// so a held Super arrives here as a burst of release/press pairs. Acting on
+    /// the release immediately committed and reopened the field on every motion
+    /// key, which is the flicker that made held-Super hjkl look broken. Holding
+    /// the release for [`SUPER_BOUNCE`] lets a re-press inside that window
+    /// cancel it, so a synthetic lift is invisible and a real one still
+    /// resolves a frame or two later.
+    pending_super_release: Option<(std::time::Instant, bool)>,
+    /// Whether holding Super opens the card-strip overview. On by default:
+    /// the compositor muscle memory this app lives inside (niri, GNOME) puts
+    /// "zoom out to everything" on the Super key. The flag stays so the
+    /// gesture can be benched again as a flip rather than a revert.
+    super_overview: bool,
     clipboard: clipboard::Clipboard,
     /// Pointer position in logical units, tracked for click and drag.
     pointer: (f64, f64),
@@ -109,6 +133,14 @@ struct App {
     /// this instead of the GPU state, so input handling is testable without a
     /// window and can never disagree with what was actually drawn.
     frame: layout::Frame,
+    /// Throttled `/proc` reader behind the chrome row's RAM caption. Owned
+    /// here rather than by the model so a frame stays a pure function of the
+    /// model.
+    mem_sampler: mem::Sampler,
+    /// Live per-frame timing, off unless `JCODE_DESKTOP2_FRAME_METER` is set.
+    /// Lives on the app rather than the render state so the CPU-side build span
+    /// can be timed around `build_scene`, which the render state never sees.
+    frame_meter: frame_meter::FrameMeter,
 }
 
 impl Default for App {
@@ -119,8 +151,9 @@ impl Default for App {
             model: Model::default(),
             harness: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
-            alt_held_since: None,
-            alt_overview: false,
+            super_held_since: None,
+            pending_super_release: None,
+            super_overview: true,
             clipboard: clipboard::Clipboard::default(),
             pointer: (0.0, 0.0),
             dragging: false,
@@ -135,6 +168,8 @@ impl Default for App {
             // A sensible frame until the first real one is built, so input
             // before the first paint is still handled sanely.
             frame: layout::Frame::new((1100, 720), 1.0),
+            mem_sampler: mem::Sampler::default(),
+            frame_meter: frame_meter::FrameMeter::from_env(),
         }
     }
 }
@@ -145,23 +180,74 @@ const DONUT_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// Maximum gap between two clicks that still counts as a double click.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// How quickly Alt must go back up for the press to count as a tap rather
+/// How quickly Super must go back up for the press to count as a tap rather
 /// than a gesture.
 ///
-/// The field opens the instant Alt goes down, because a hold threshold made
-/// the most-used shortcut in the app feel like it was thinking. Alt is still
-/// the first half of a dozen editing chords, so the two escapes are: any key
-/// pressed with Alt aborts the field in the same frame, and letting Alt back
-/// up this fast dismisses without switching session. Neither costs the user
-/// anything they had, and a deliberate hold shows the field immediately.
-const ALT_TAP: std::time::Duration = std::time::Duration::from_millis(180);
+/// The field opens the instant Super goes down, because a hold threshold made
+/// the most-used shortcut in the app feel like it was thinking. Super is
+/// still the first half of editing and navigation chords, so the two escapes
+/// are: any chord key pressed with Super aborts the field in the same frame,
+/// and letting Super back up this fast dismisses without switching session.
+/// Neither costs the user anything they had, and a deliberate hold shows the
+/// field immediately.
+const SUPER_TAP: std::time::Duration = std::time::Duration::from_millis(180);
+
+/// How long a Super release is held before it is acted on, so a remapper's
+/// synthetic lift-and-press around a rewritten key does not read as the user
+/// letting go. Long enough to cover the release/press pair (which arrive in the
+/// same input batch, microseconds apart) and short enough that a real release
+/// still commits within a frame or two.
+const SUPER_BOUNCE: std::time::Duration = std::time::Duration::from_millis(90);
+
+/// Frame interval for an indeterminate progress bar's sweep. Well short of
+/// the display rate: the segment crosses the track over more than a second, so
+/// 40ms is smooth to the eye while costing a fraction of a display-paced
+/// animation, and it stays outside [`CONTINUOUS_FRAME`] so a window waiting on
+/// a build sleeps between wakes instead of chaining frames.
+const PROGRESS_FRAME: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// Frame interval while the overview zooms (~60fps).
 const OVERVIEW_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// Deadlines closer than this are a continuous animation (the donut, the
+/// overview zoom, the streaming reveal, the scroll glide), and those are paced
+/// by the display rather than by the timer: the next frame is requested the
+/// moment one is drawn, and the compositor's frame callback decides when it
+/// paints. A timer cannot do this job. 16ms beats against a 16.7ms refresh, so
+/// the wake periodically lands just after the compositor's deadline and a
+/// frame is skipped: a visible hitch every few hundred milliseconds in an
+/// otherwise smooth glide. Wide enough to catch every per-frame cadence in
+/// use, narrow enough to exclude the sparse wakes (the 90ms spinner, the
+/// caret's half-second blink), which stay on timers so an idle window sleeps.
+const CONTINUOUS_FRAME: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Frame interval for an *unfocused* window that still has something to say:
+/// a turn in flight, a reply streaming in, a scroll glide landing. Those
+/// animations carry information (the spinner proves the agent is alive, the
+/// reveal is the reply arriving), so freezing them while the user watches
+/// from another window reads as a hang. Ten frames a second keeps the window
+/// visibly alive at a fraction of the display-rate cost; decorative motion
+/// (the caret's blink, the donut) stays asleep until focus returns. Wider
+/// than [`CONTINUOUS_FRAME`], so background wakes stay on the timer path
+/// rather than chaining display-paced frames.
+const BACKGROUND_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Lines of transcript one notch of a discrete mouse wheel travels.
+///
+/// A notch is not a line: it is the coarsest input the user has, and every
+/// other application on the desktop moves a handful of lines per notch (three
+/// is the GTK, Chromium and Firefox default). Moving one line per notch is the
+/// single loudest reason wheel scrolling here felt like wading, because it
+/// makes a page of transcript cost thirty notches.
+pub(crate) const WHEEL_LINES: f64 = 3.0;
+
 /// UI model: what the frame is built from.
 pub struct Model {
     pub theme: theme::Theme,
+    /// What the user asked for (light, dark, or follow the system). Kept
+    /// beside the resolved theme so a system-mode window can re-resolve when
+    /// the desktop flips its preference, without forgetting it was "system".
+    pub theme_preference: theme::ThemeMode,
     /// Build identity shown in the masthead: version, updates, account.
     pub meta: meta::Meta,
     pub status: String,
@@ -192,6 +278,13 @@ pub struct Model {
     pub selection: Option<select::Selection>,
     /// Transient one-line notice (e.g. "nothing to undo").
     pub notice: Option<String>,
+    /// The most recent failure, until the next turn starts.
+    ///
+    /// Separate from [`Self::status`] because the status line is suppressed for
+    /// an attached session (a healthy connection is noise), and a failure is
+    /// the one thing that must survive that rule: losing the connection
+    /// mid-session is invisible otherwise.
+    pub failure: Option<String>,
     /// The hero donut's luminance field, or `None` when the donut is off
     /// (reduced motion, or a headless capture that wants a still frame).
     pub donut: Option<donut::Donut>,
@@ -208,12 +301,12 @@ pub struct Model {
     pub smooth: scroll::Smooth,
     /// Live sessions, drawn as the strip at the top of the window.
     pub strip: strip::Strip,
-    /// The session overview: the blob field held Alt zooms out into. Part of
+    /// The session overview: the card strip held Super zooms out into. Part of
     /// the model so a frame stays a pure function of it and every phase of
     /// the zoom is capturable.
     pub overview: overview::Overview,
     /// Fetched tails of the other sessions, so the field can show *which*
-    /// conversation each blob is rather than only its name.
+    /// conversation each card is rather than only its name.
     pub peeks: overview::Peeks,
     /// Working directory of the attached session, as the daemon reports it.
     /// `None` until attach, because a guess here is worse than silence: it is
@@ -223,6 +316,21 @@ pub struct Model {
     /// `None` until then, so the caption appears rather than showing a guess
     /// that could be wrong.
     pub model: Option<ModelId>,
+    /// The boot-up reveal: black paper, the donut growing in, then the rest of
+    /// the window. Default is *finished*, so captures and tests see the settled
+    /// frame; the real window replaces it on the first paint.
+    pub boot: boot::Boot,
+    /// When the first background-progress card appeared, or `None` when none
+    /// are on screen.
+    ///
+    /// One clock for all of them, so an indeterminate bar's sweep is a pure
+    /// function of the model (a pinned capture passes its own `now`) and so
+    /// several bars sweep in step rather than each starting its own phase.
+    pub progress_clock: Option<std::time::Instant>,
+    /// Live RAM readout for this window and the daemon, drawn on the trailing
+    /// end of the top chrome row. `None` until the first sample, and always
+    /// `None` in pinned captures, so frames stay deterministic.
+    pub mem: Option<mem::Readout>,
 }
 
 /// The provider and model answering this session.
@@ -251,10 +359,18 @@ impl Default for Model {
     fn default() -> Self {
         Self {
             theme: theme::Theme::from_env(),
+            theme_preference: theme::Theme::preference_from_env(),
             meta: meta::Meta::detect(),
             status: "starting...".into(),
             session_id: None,
-            transcript: transcript::Transcript::default(),
+            transcript: {
+                // The user's thinking-display choice is theirs, so it is read
+                // once here rather than consulted per delta: a mid-turn config
+                // edit must not change what the transcript on screen means.
+                let mut transcript = transcript::Transcript::default();
+                transcript.set_reasoning_mode(reasoning::ReasoningMode::from_env());
+                transcript
+            },
             editor: editor::Editor::default(),
             caret: caret::Caret::default(),
             busy: false,
@@ -263,6 +379,7 @@ impl Default for Model {
             scroll: 0.0,
             selection: None,
             notice: None,
+            failure: None,
             donut: (!donut_disabled()).then(|| donut::Donut::new(DONUT_GRID)),
             spin: donut::Spin::default(),
             hint: hints::arbitrary_index(),
@@ -273,6 +390,9 @@ impl Default for Model {
             peeks: overview::Peeks::default(),
             working_dir: None,
             model: None,
+            boot: boot::Boot::default(),
+            progress_clock: None,
+            mem: None,
         }
     }
 }
@@ -296,7 +416,7 @@ fn donut_disabled() -> bool {
 impl Model {
     /// Scroll up by `amount` logical pixels, clamped to `max` so the view
     /// cannot run past the top of the conversation into blank space.
-    fn scroll_up(&mut self, amount: f64, max: f64) {
+    pub(crate) fn scroll_up(&mut self, amount: f64, max: f64) {
         let before = self.scroll;
         self.scroll = (self.scroll + amount).clamp(0.0, max.max(0.0));
         self.smooth
@@ -304,11 +424,48 @@ impl Model {
     }
 
     /// Scroll down by `amount` logical pixels; reaching 0 re-follows the tail.
-    fn scroll_down(&mut self, amount: f64) {
+    pub(crate) fn scroll_down(&mut self, amount: f64) {
         let before = self.scroll;
         self.scroll = (self.scroll - amount).max(0.0);
         self.smooth
             .nudge(self.scroll - before, std::time::Instant::now());
+    }
+
+    /// Move the view by `delta` logical pixels from a wheel or trackpad
+    /// gesture: positive travels toward older content. Unlike a keyboard jump
+    /// this lands the pixels immediately and feeds the momentum estimator, so
+    /// the transcript tracks the fingers and then coasts like a browser page.
+    ///
+    /// Returns whether the whole delta fitted; a clamped edge is reported so
+    /// the caller can end the fling rather than grind against the boundary.
+    pub(crate) fn scroll_gesture(&mut self, delta: f64, max: f64, now: std::time::Instant) -> bool {
+        let before = self.scroll;
+        self.scroll = (self.scroll + delta).clamp(0.0, max.max(0.0));
+        let moved = self.scroll - before;
+        self.smooth.glide_from(delta, now);
+        (moved - delta).abs() < 0.5
+    }
+
+    /// Apply the travel a fling still owes the view. Called once per frame, so
+    /// the coast is paced by the display rather than by event arrival.
+    /// Whether a fling still owes the view travel, so the caller can skip the
+    /// cost of measuring the document on an idle frame.
+    pub(crate) fn has_momentum(&self) -> bool {
+        self.smooth.has_momentum()
+    }
+
+    pub(crate) fn apply_momentum(&mut self, max: f64) {
+        let pending = self.smooth.take_momentum();
+        if pending == 0.0 {
+            return;
+        }
+        let before = self.scroll;
+        self.scroll = (self.scroll + pending).clamp(0.0, max.max(0.0));
+        // Coasting into the top or the tail is over: grinding against the
+        // clamp would keep the window repainting for no visible movement.
+        if ((self.scroll - before) - pending).abs() >= 0.5 {
+            self.smooth.stop();
+        }
     }
 
     /// The scroll offset the frame is actually drawn at.
@@ -354,311 +511,30 @@ impl Model {
         if let Some(notice) = &self.notice {
             return Some(notice.clone());
         }
-        // The activity line normally lives in the empty composer. When the user
-        // has already typed the next message the ghost line is gone, so it
-        // moves down here rather than disappearing: "is it working?" must be
-        // answerable in every state, not just the idle-composer one.
-        if self.busy
-            && !self.editor.is_empty()
-            && let Some(line) = self.activity.line(std::time::Instant::now())
-        {
-            return Some(line);
+        // A failure outranks progress: whatever the app was doing, this is what
+        // the user needs to know, and it is shown whether or not a session is
+        // attached.
+        if let Some(failure) = &self.failure {
+            return Some(failure.clone());
         }
         if self.scroll > 0.0 {
             return Some("scrolled back".to_string());
         }
-        self.status_footnote().or_else(|| self.meta.alert())
+        self.status_footnote()
+            .or_else(|| self.meta.alert())
+            // Nothing to report: on an empty page say which build this is.
+            // The version is the one question a user cannot answer from the
+            // window, and an idle transcript is the only place with room for
+            // it, so it never competes with an actionable message.
+            .or_else(|| {
+                self.transcript
+                    .is_empty()
+                    .then(|| self.meta.version.clone())
+            })
     }
 }
 
 impl App {
-    fn drain_harness_updates(&mut self) {
-        let Some((updates, _)) = self.harness.as_ref() else {
-            return;
-        };
-        while let Ok(update) = updates.try_recv() {
-            match update {
-                harness::HarnessUpdate::Status(status) => self.model.status = status,
-                harness::HarnessUpdate::Attached {
-                    session_id,
-                    working_dir,
-                } => {
-                    self.model.status = format!("attached: {session_id}");
-                    self.model.strip.focus_session(&session_id);
-                    self.model.session_id = Some(session_id);
-                    self.model.working_dir = working_dir;
-                    self.retitle();
-                }
-                harness::HarnessUpdate::Model { provider, model } => {
-                    self.model.model = Some(ModelId { provider, model });
-                }
-                harness::HarnessUpdate::Text(text) => {
-                    self.model.transcript.append_assistant(&text);
-                    // Chase the new length rather than jumping to it: the
-                    // reveal is what turns a burst of tokens into a sweep.
-                    self.model.stream.extend_to(
-                        self.model.transcript.streaming_len(),
-                        std::time::Instant::now(),
-                    );
-                }
-                harness::HarnessUpdate::Reasoning(text) => {
-                    self.model.transcript.append_reasoning(&text);
-                    // Reasoning is revealed by the same sweep as the reply, so
-                    // a thought does not appear as an instant wall of text
-                    // while the answer below it types itself out.
-                    self.model.stream.extend_to(
-                        self.model.transcript.streaming_len(),
-                        std::time::Instant::now(),
-                    );
-                }
-                harness::HarnessUpdate::Activity(label) => {
-                    self.model.busy = true;
-                    self.model
-                        .activity
-                        .set_label(label, std::time::Instant::now());
-                }
-                harness::HarnessUpdate::Tool { call_id, label } => {
-                    // Progress belongs in the transcript, not only in the
-                    // composer's activity line: the call running right now is
-                    // one card at the tail that refines in place as its
-                    // streamed intent arrives, and the next call takes it
-                    // over rather than adding a row.
-                    self.model.busy = true;
-                    self.model.transcript.set_live_tool(&call_id, &label);
-                    self.model.stream.extend_to(
-                        self.model.transcript.streaming_len(),
-                        std::time::Instant::now(),
-                    );
-                }
-                harness::HarnessUpdate::TurnDone => {
-                    self.model.busy = false;
-                    self.model.activity.finish();
-                    // The card shows the call in flight; the turn ending means
-                    // there is none, and a card left behind would claim work
-                    // is still happening.
-                    self.model.transcript.clear_live_tool();
-                }
-                harness::HarnessUpdate::Peek {
-                    session_id,
-                    transcript,
-                } => {
-                    // The attached session's own transcript comes from the
-                    // stream, so a peek reply for it is only ever cache: it
-                    // must not overwrite the live page.
-                    self.model.peeks.insert(&session_id, transcript);
-                }
-                harness::HarnessUpdate::Sessions(entries) => {
-                    // Rebuild around the session we are actually attached to,
-                    // so a refresh never silently moves the highlight off the
-                    // conversation currently on screen.
-                    self.model.strip =
-                        strip::Strip::build(entries, self.model.session_id.as_deref());
-                }
-            }
-        }
-    }
-
-    /// Switch to whichever session the strip now points at.
-    ///
-    /// The transcript belongs to the session, so it is cleared rather than
-    /// carried across: appending another conversation's output to the one on
-    /// screen would be actively misleading. Reloading real history needs
-    /// `GetHistory`; until that is wired, an empty page is the honest state.
-    fn attach_focused_session(&mut self) {
-        let Some(target) = self.model.strip.focused_session().map(str::to_string) else {
-            return;
-        };
-        if self.model.session_id.as_deref() == Some(target.as_str()) {
-            return;
-        }
-        self.model.transcript = transcript::Transcript::default();
-        self.model.stream.reveal_all();
-        self.model.busy = false;
-        self.model.activity.finish();
-        self.model.scroll = 0.0;
-        // Attaching is a jump, not a scroll: easing here would sweep through
-        // the previous session's layout.
-        self.model.smooth.settle();
-        self.model.status = format!("attaching: {target}");
-        self.model.session_id = Some(target.clone());
-        // The new session's directory arrives with its `Attached` event; until
-        // then show the strip's entry rather than the previous session's path,
-        // which would name the wrong project.
-        self.model.working_dir = self.model.strip.focused_working_dir().map(str::to_string);
-        self.retitle();
-        if let Some((_, outgoing)) = self.harness.as_ref() {
-            let _ = outgoing.send(harness::Command::Attach(target));
-        }
-    }
-
-    /// Lay out the blob field for the current model.
-    ///
-    /// Rebuilt per call rather than cached: it is pure arithmetic over a
-    /// handful of sessions, and a cache here would be one more thing that can
-    /// disagree with what was drawn when a poll changes the session set
-    /// mid-gesture.
-    fn overview_field(&self) -> overview::Field {
-        overview::layout(
-            &self.model.strip.entries(),
-            self.model
-                .overview
-                .focus()
-                .or(self.model.session_id.as_deref()),
-            self.model.session_id.as_deref(),
-            overview::area(&self.frame),
-        )
-    }
-
-    /// Open the overview, highlighting the session we are in so the gesture
-    /// starts from where the user already is.
-    fn open_overview(&mut self) {
-        if self.model.overview.is_open() {
-            return;
-        }
-        self.model.overview.open(self.model.session_id.as_deref());
-        self.request_peek();
-        self.request_redraw();
-    }
-
-    /// Fetch the highlighted session's conversation tail, if we do not have
-    /// it yet, so hovering a blob shows *which* conversation it is.
-    ///
-    /// Only the highlighted one: prefetching the whole field would send a
-    /// burst of reads on every open for previews the user will mostly never
-    /// look at. Cached once fetched, so moving back and forth across the field
-    /// is instant after the first visit.
-    fn request_peek(&mut self) {
-        let Some(target) = self
-            .model
-            .overview
-            .focus()
-            .or(self.model.session_id.as_deref())
-            .map(str::to_string)
-        else {
-            return;
-        };
-        if !self.model.peeks.should_request(&target) {
-            return;
-        }
-        if let Some((_, outgoing)) = self.harness.as_ref() {
-            let _ = outgoing.send(harness::Command::Peek(target));
-        }
-    }
-
-    /// Close the field, attaching to the highlighted session when `commit`.
-    ///
-    /// Commit and cancel share one path so they can never drift: the only
-    /// difference is whether the highlight is acted on.
-    fn close_overview(&mut self, commit: bool) {
-        if !self.model.overview.is_visible() {
-            return;
-        }
-        if commit
-            && let Some(target) = self.model.overview.focus().map(str::to_string)
-            && self.model.session_id.as_deref() != Some(target.as_str())
-            && self.model.strip.focus_session(&target)
-        {
-            self.attach_focused_session();
-        }
-        self.model.overview.close();
-        self.request_redraw();
-    }
-
-    /// Move the highlight across the field.
-    fn move_overview(&mut self, dir: overview::Dir) {
-        let field = self.overview_field();
-        let from = self
-            .model
-            .overview
-            .focus()
-            .or(self.model.session_id.as_deref())
-            .unwrap_or_default()
-            .to_string();
-        if let Some(target) = field.neighbor(&from, dir) {
-            let id = target.session_id.clone();
-            self.model.overview.set_focus(&id);
-            self.request_peek();
-            self.request_redraw();
-        }
-    }
-
-    /// Step the highlight through the field in reading order.
-    fn cycle_overview(&mut self, step: isize) {
-        let field = self.overview_field();
-        let from = self
-            .model
-            .overview
-            .focus()
-            .or(self.model.session_id.as_deref())
-            .unwrap_or_default()
-            .to_string();
-        if let Some(target) = field.next_in_order(&from, step) {
-            let id = target.to_string();
-            self.model.overview.set_focus(&id);
-            self.request_peek();
-            self.request_redraw();
-        }
-    }
-
-    /// Alt went down or came up.
-    ///
-    /// Pressing it opens the session overview at once, and releasing it
-    /// commits to the highlighted session unless the press was a tap shorter
-    /// than [`ALT_TAP`]. Tracked from the modifier event rather than from a
-    /// key event because a bare modifier never produces one of its own.
-    ///
-    /// A named method rather than an inline arm so the tests drive the same
-    /// code the window does: a test that reimplemented this gesture would keep
-    /// passing after the real handler stopped opening anything.
-    fn on_alt_changed(&mut self, down: bool, now: std::time::Instant) {
-        if !self.alt_overview && !self.model.overview.is_visible() {
-            // The gesture is benched: Alt stays a plain chord modifier. The
-            // visibility check keeps release handling sane if the flag is
-            // ever flipped off while the field is up.
-            return;
-        }
-        if down {
-            if self.alt_held_since.is_none() && !self.model.overview.is_open() {
-                self.alt_held_since = Some(now);
-                self.open_overview();
-            }
-            return;
-        }
-        let tap = self
-            .alt_held_since
-            .is_some_and(|since| now.duration_since(since) < ALT_TAP);
-        self.alt_held_since = None;
-        if tap && self.model.overview.focus() == self.model.session_id.as_deref() {
-            // A bare tap on Alt, with the highlight never moved: the user was
-            // reaching for a chord they did not finish, not switching session.
-            // Take the field straight off screen rather than zooming it out.
-            self.model.overview.abort();
-            self.request_redraw();
-            return;
-        }
-        // Releasing Alt flies into whichever blob is highlighted.
-        self.close_overview(true);
-    }
-
-    /// Advance the overview's zoom one frame.
-    ///
-    /// Done on the frame rather than on a timer thread so the zoom is driven
-    /// by the same clock as everything else on screen, and so a window that is
-    /// not drawing is not silently animating either.
-    fn tick_overview(&mut self, now: std::time::Instant) {
-        // Its own clock, not the donut's: the donut stops advancing the
-        // moment there is a transcript, and a zoom driven by a stopped clock
-        // would freeze halfway in exactly the sessions worth switching to.
-        let dt = self
-            .overview_frame
-            .map(|last| now.duration_since(last).as_secs_f32().min(0.1))
-            .unwrap_or(OVERVIEW_FRAME.as_secs_f32());
-        self.overview_frame = Some(now);
-        if self.model.overview.advance(dt) {
-            self.request_redraw();
-        }
-    }
-
     fn submit_input(&mut self) {
         if self.model.editor.text().trim().is_empty() {
             return;
@@ -671,17 +547,51 @@ impl App {
         // Move to the next hint, so the set is discovered across turns instead
         // of one line being the whole of the user's experience of it.
         self.model.hint = self.model.hint.wrapping_add(1);
-        self.model
-            .transcript
-            .push(transcript::Message::user(content.clone()));
+        // Mid-turn, the daemon refuses a second message outright ("already
+        // processing"), so the message is not sent: it waits at the tail of
+        // the transcript in the queued tone, and the turn ending is what
+        // sends it (see `flush_queued_message`).
+        let queued = self.model.busy;
+        self.model.transcript.push(match queued {
+            true => transcript::Message::queued(content.clone()),
+            false => transcript::Message::sent(content.clone()),
+        });
+        // Sending clears the last failure: the user has responded to it, and a
+        // stale "no network" footnote hanging over a fresh turn would be a
+        // report about the past.
+        self.model.failure = None;
+        // Submitting jumps back to the live tail; otherwise the reply streams
+        // in off-screen.
+        self.model.scroll = 0.0;
+        if queued {
+            // The turn is still streaming its reply above the queued card, so
+            // the reveal must keep running; resetting it here would replay
+            // text the user has already read.
+            return;
+        }
         // The user's own message was typed, not streamed: revealing it would
         // animate text they are already looking at.
         self.model.stream.reveal_all();
         self.model.busy = true;
         self.model.activity.start(std::time::Instant::now());
-        // Submitting jumps back to the live tail; otherwise the reply streams
-        // in off-screen.
-        self.model.scroll = 0.0;
+        if let Some((_, outgoing)) = self.harness.as_ref() {
+            let _ = outgoing.send(harness::Command::Send(content));
+        }
+    }
+
+    /// Send the oldest queued message, now that the turn it waited out is
+    /// over. One per turn boundary: the daemon takes one message at a time,
+    /// and the rest of the queue waits for the turn this one starts.
+    ///
+    /// The promotion is what the queued tone and the wiggle hang off: the
+    /// card leaves the faint "not sent yet" state, nods, and takes the normal
+    /// transcript ink, exactly as if it had been submitted at this moment.
+    pub(crate) fn flush_queued_message(&mut self) {
+        let Some(content) = self.model.transcript.promote_oldest_queued() else {
+            return;
+        };
+        self.model.busy = true;
+        self.model.activity.start(std::time::Instant::now());
         if let Some((_, outgoing)) = self.harness.as_ref() {
             let _ = outgoing.send(harness::Command::Send(content));
         }
@@ -728,7 +638,7 @@ impl App {
         // than one session to move between (the strip proper), or a working
         // directory to name. With neither it would be a widget saying "1 of 1"
         // about nowhere, so nothing is reserved and the page is unchanged.
-        let strip = model.strip.len() > 1 || model.working_dir.is_some();
+        let strip = model.strip.len() > 1 || model.working_dir.is_some() || model.mem.is_some();
         // Measure the conversation so the composer can sit just under the
         // last reply while it is short, instead of floating at the middle of
         // the page with a gap above it. Content height is a function of the
@@ -778,11 +688,11 @@ impl App {
     fn on_pointer_pressed(&mut self) {
         let (x, y) = self.pointer;
         // The field is modal: a click in it picks a session, and a click on
-        // the paper between blobs dismisses, like any overview.
+        // the paper between cards dismisses, like any overview.
         if self.model.overview.is_open() {
             match self.overview_field().hit(x, y) {
-                Some(blob) => {
-                    let id = blob.session_id.clone();
+                Some(card) => {
+                    let id = card.session_id.clone();
                     self.model.overview.set_focus(&id);
                     self.close_overview(true);
                 }
@@ -935,12 +845,12 @@ impl App {
     fn on_pointer_moved(&mut self) {
         // Hovering the field moves the highlight, so the mouse and the arrows
         // drive one selection rather than two competing ones. A hover off the
-        // blobs leaves the highlight where it was: sliding across the gap
+        // cards leaves the highlight where it was: sliding across the gap
         // between two sessions must not deselect the one you were on.
         if self.model.overview.is_open() {
             let (x, y) = self.pointer;
-            if let Some(blob) = self.overview_field().hit(x, y) {
-                let id = blob.session_id.clone();
+            if let Some(card) = self.overview_field().hit(x, y) {
+                let id = card.session_id.clone();
                 if self.model.overview.focus() != Some(id.as_str()) {
                     self.model.overview.set_focus(&id);
                     self.request_peek();
@@ -1053,15 +963,60 @@ impl App {
     pub fn animation_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
         // The overview is the one animation that must run whether or not the
         // window thinks it is focused: a compositor that steals focus while
-        // Alt is held would otherwise freeze the field mid-zoom.
+        // Super is held would otherwise freeze the field mid-zoom.
         let overview = self
             .model
             .overview
             .is_animating()
             .then(|| now + OVERVIEW_FRAME);
+        // A held Super release waiting out the remapper bounce needs a frame to
+        // resolve on, or a gesture ended by letting go with nothing else moving
+        // on screen would sit open until the next unrelated event.
+        let bounce = self
+            .pending_super_release
+            .map(|(at, _)| at + crate::SUPER_BOUNCE);
         if !self.model.focused {
-            return overview;
+            // An unfocused window drops the decorative motion (the caret, the
+            // donut) but not the informative kind: the spinner is the proof a
+            // turn is still running, and the streaming reveal is the reply
+            // itself arriving. Freezing those while the user watches from
+            // another window makes progress look like a hang, so they keep
+            // ticking at a low background cadence instead of the display rate.
+            let spinner = self
+                .model
+                .activity
+                .next_frame_at(now)
+                .map(|_| now + BACKGROUND_FRAME);
+            let stream = self
+                .model
+                .stream
+                .next_frame_at(now)
+                .map(|_| now + BACKGROUND_FRAME);
+            // The scroll ease and the bar's fade also finish in the
+            // background, so a window left mid-glide does not freeze with the
+            // scrollbar half-faded until focus returns.
+            let smooth = self
+                .model
+                .smooth
+                .next_frame_at(now)
+                .map(|_| now + BACKGROUND_FRAME);
+            // The reveal keeps running unfocused: a window opened behind the
+            // pointer's focus must not be stuck on a black frame.
+            let boot = self.model.boot.next_frame_at(now);
+            // A progress bar is informative motion too, and waiting on a build
+            // from another window is exactly when a user watches it, so an
+            // indeterminate bar keeps sweeping at the background cadence.
+            let progress = (self.model.progress_clock.is_some()
+                && self.model.transcript.has_indeterminate_progress())
+            .then(|| now + BACKGROUND_FRAME);
+            return [overview, bounce, spinner, stream, smooth, boot, progress]
+                .into_iter()
+                .flatten()
+                .min();
         }
+        // The boot reveal outranks everything: it is the first thing on screen
+        // and it must not be paced by whatever else happens to be animating.
+        let boot = self.model.boot.next_frame_at(now);
         let caret = (!self.model.busy)
             .then(|| self.model.caret.next_toggle_at(now))
             .flatten();
@@ -1076,10 +1031,36 @@ impl App {
         // Scroll smoothing and the scrollbar fade both need frames, and both
         // stop themselves once the view has landed and the bar is gone.
         let smooth = self.model.smooth.next_frame_at(now);
-        [caret, donut, spinner, stream, smooth, overview]
-            .into_iter()
-            .flatten()
-            .min()
+        // An indeterminate progress bar sweeps, so it needs frames for as long
+        // as a task is running without a percentage. A determinate bar is a
+        // still image between ticks and asks for nothing.
+        let progress = (self.model.progress_clock.is_some()
+            && self.model.transcript.has_indeterminate_progress())
+        .then(|| now + PROGRESS_FRAME);
+        // The delivery wiggle: short, and it stops itself, so an idle window
+        // with every message acknowledged still sleeps.
+        let ack = self
+            .model
+            .transcript
+            .deliveries()
+            .filter_map(|delivery| delivery.next_frame_at(now))
+            .min();
+        [
+            caret, donut, spinner, stream, smooth, overview, bounce, boot, ack, progress,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Whether the frame just drawn should be followed immediately by another:
+    /// true while a continuous animation (donut, overview zoom, streaming
+    /// reveal, scroll glide) is running. Sparse wakes (the caret's blink, the
+    /// 90ms spinner) return false and stay on the `WaitUntil` timer, so an
+    /// idle window still sleeps.
+    pub fn wants_display_paced_frame(&self, now: std::time::Instant) -> bool {
+        self.animation_deadline(now)
+            .is_some_and(|at| at <= now + CONTINUOUS_FRAME)
     }
 
     /// Height of the transcript region in logical units.
@@ -1201,6 +1182,15 @@ impl App {
             Action::OverviewCommit => self.close_overview(true),
             Action::OverviewCancel => self.close_overview(false),
 
+            // A view choice, applied live: the notice is the only feedback the
+            // user gets when the mode change has no immediate visible effect
+            // (nothing is thinking right now).
+            Action::CycleReasoningDisplay => {
+                let next = self.model.transcript.reasoning_mode().cycle();
+                self.model.transcript.set_reasoning_mode(next);
+                self.model.set_notice(format!("thinking: {}", next.label()));
+            }
+
             Action::InsertNewline => self.model.editor.insert_char('\n'),
 
             Action::MoveLeft => self.model.editor.move_left(),
@@ -1216,6 +1206,16 @@ impl App {
             Action::ExtendWordRight => self.model.editor.extend_word_right(),
             Action::ExtendHome => self.model.editor.extend_home(),
             Action::ExtendEnd => self.model.editor.extend_end(),
+            Action::ExtendLineUp => {
+                self.model.editor.extend_line(-1);
+            }
+            Action::ExtendLineDown => {
+                self.model.editor.extend_line(1);
+            }
+            Action::MoveDocStart => self.model.editor.move_to_start(),
+            Action::MoveDocEnd => self.model.editor.move_to_end(),
+            Action::ExtendDocStart => self.model.editor.extend_to_start(),
+            Action::ExtendDocEnd => self.model.editor.extend_to_end(),
             Action::SelectAll => self.model.editor.select_all(),
 
             Action::DeleteBack => self.model.editor.delete_back(),
@@ -1243,6 +1243,22 @@ impl App {
                 if !self.model.editor.undo() {
                     self.model.set_notice("nothing to undo");
                 }
+            }
+            Action::Redo => {
+                if !self.model.editor.redo() {
+                    self.model.set_notice("nothing to redo");
+                }
+            }
+            // Web Ctrl+C: copying is what the user meant whenever there is
+            // anything selected. Only a completely unselected Ctrl+C is allowed
+            // to interrupt, so the chord can never eat a copy.
+            Action::CopyOrInterrupt => {
+                let has_selection =
+                    self.model.selection.is_some() || self.model.editor.selection().is_some();
+                if has_selection {
+                    return self.apply(Action::Copy, None);
+                }
+                return self.apply(Action::InterruptOrQuit, None);
             }
             Action::Copy => {
                 // A transcript highlight wins: it is the visible selection, and
@@ -1367,6 +1383,10 @@ impl ApplicationHandler for App {
         self.harness = Some(harness::spawn(move || redraw_window.request_redraw()));
         let state = pollster::block_on(render::RenderState::new(window)).expect("init gpu");
         self.state = Some(state);
+        // Start the reveal at the moment the surface exists, not at process
+        // start: GPU init takes long enough that timing it from `main` would
+        // spend the whole sequence before the first frame is presented.
+        self.model.boot = boot::Boot::start(std::time::Instant::now());
     }
 
     fn window_event(
@@ -1409,6 +1429,10 @@ impl ApplicationHandler for App {
                     .map(|state| state.scale_factor())
                     .unwrap_or(1.0);
                 self.pointer = (position.x / scale, position.y / scale);
+                // A keystroke ends the reveal at once: an animation that eats
+                // the user's first character, or makes them watch it finish, is
+                // worse than no animation.
+                self.model.boot = boot::Boot::default();
                 if std::env::var_os("JCODE_DESKTOP2_LOG_INPUT").is_some() {
                     eprintln!(
                         "[input] move to ({:.1}, {:.1}) logical",
@@ -1434,30 +1458,83 @@ impl ApplicationHandler for App {
             } => {
                 self.paste_primary_selection();
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 // Scrolling the transcript with the wheel, in logical pixels
                 // so a trackpad's fine-grained deltas are not quantised to
                 // whole lines.
-                let pixels = match delta {
+                //
+                // A notch from a discrete wheel is a jump, so it keeps the
+                // exponential ease that turns the teleport into a glide. A
+                // trackpad's pixel deltas are the finger's own position, so
+                // they land immediately and feed the momentum estimator: the
+                // page tracks the fingers and then coasts, like a browser.
+                //
+                // `phase` is what makes the coast trustworthy. Guessing the
+                // release from event timing turns every pause in a slow drag
+                // into a fling that fights the finger, so the backend's own
+                // start/end is taken whenever it offers one.
+                match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => {
-                        f64::from(y) * self.frame.body_line_height()
+                        let pixels = f64::from(y) * self.frame.body_line_height() * WHEEL_LINES;
+                        if pixels > 0.0 {
+                            let max = self.max_scroll();
+                            self.model.scroll_up(pixels, max);
+                        } else if pixels < 0.0 {
+                            self.model.scroll_down(-pixels);
+                        }
                     }
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y / self.frame.scale,
-                };
-                if pixels > 0.0 {
-                    let max = self.max_scroll();
-                    self.model.scroll_up(pixels, max);
-                } else if pixels < 0.0 {
-                    self.model.scroll_down(-pixels);
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        // Only here is the phase meaningful: a discrete notch
+                        // arrives with a hard-coded `Moved` that never ends, so
+                        // reading it would pin the view in a gesture that never
+                        // closes. See `Smooth::phase_known`.
+                        let held = matches!(
+                            phase,
+                            winit::event::TouchPhase::Started | winit::event::TouchPhase::Moved
+                        );
+                        self.model.smooth.gesture_held(held);
+                        let pixels = pos.y / self.frame.scale;
+                        if pixels != 0.0 {
+                            let max = self.max_scroll();
+                            let now = std::time::Instant::now();
+                            if !self.model.scroll_gesture(pixels, max, now) {
+                                self.model.smooth.stop();
+                            }
+                        }
+                    }
                 }
                 self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
-                self.on_alt_changed(self.modifiers.alt_key(), std::time::Instant::now());
+                self.on_super_changed(self.modifiers.super_key(), std::time::Instant::now());
+            }
+            // The desktop flipped between light and dark. Only a window in
+            // System mode follows: an explicit JCODE_DESKTOP2_THEME choice is
+            // the user overriding the desktop, and must keep winning.
+            WindowEvent::ThemeChanged(system) => {
+                if self.model.theme_preference == theme::ThemeMode::System {
+                    let dark = system == winit::window::Theme::Dark;
+                    self.model.theme = theme::Theme::for_mode(theme::ThemeMode::System, dark);
+                    // The transcript cache keys on the theme, so the switch
+                    // relayouts on the next frame without an explicit flush.
+                    self.request_redraw();
+                }
             }
             WindowEvent::Focused(focused) => {
                 self.model.focused = focused;
+                if !focused {
+                    // The compositor stole the rest of the gesture (niri
+                    // grabs most Super chords for itself), so the release
+                    // will never arrive here. Take the field down rather
+                    // than leaving it stuck open under a window the user
+                    // has already left.
+                    self.super_held_since = None;
+                    self.pending_super_release = None;
+                    if self.model.overview.is_visible() {
+                        self.model.overview.abort();
+                    }
+                }
                 // Restart the blink phase on focus so the caret is immediately
                 // solid rather than appearing mid-off-phase.
                 if focused {
@@ -1475,35 +1552,18 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                // While the field is up it owns the keyboard: an unbound key
-                // is swallowed rather than typed into a composer the user
-                // cannot see. Shift+Tab steps backwards, the Alt+Tab habit.
-                if self.model.overview.is_open() {
-                    let action = if self.modifiers.shift_key()
-                        && logical_key
-                            == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab)
-                    {
-                        Some(keymap::Action::OverviewPrev)
-                    } else {
-                        keymap::resolve_overview(&logical_key)
-                    };
-                    if let Some(action) = action {
-                        self.apply(action, None);
-                        self.request_redraw();
-                    }
-                    return;
+                if std::env::var_os("JCODE_DESKTOP2_LOG_INPUT").is_some() {
+                    eprintln!(
+                        "[input] key {logical_key:?} mods {:?} overview_open {} visible {}",
+                        self.modifiers,
+                        self.model.overview.is_open(),
+                        self.model.overview.is_visible()
+                    );
                 }
-                // Alt is the first half of a dozen editing chords, so any key
-                // pressed with it takes the field straight back off screen:
-                // the user is typing, not gesturing.
-                self.alt_held_since = None;
-                if self.model.overview.is_visible() {
-                    self.model.overview.abort();
-                }
-                let action =
-                    keymap::resolve(&logical_key, self.modifiers).unwrap_or(keymap::Action::Insert);
-                let typed = text.as_ref().map(|t| t.as_str());
-                if !self.apply(action, typed) {
+                // While the field is up it owns the keyboard: bound keys
+                // drive the field, and anything else is a chord that takes
+                // the field straight back off screen.
+                if !self.key_pressed(&logical_key, text.as_ref().map(|t| t.as_str())) {
                     self.save_geometry(true);
                     event_loop.exit();
                     return;
@@ -1514,11 +1574,26 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.drain_harness_updates();
+                // Refresh the chrome row's RAM caption. Throttled inside the
+                // sampler, so per-frame redraws do not become per-frame /proc
+                // reads; between samples the previous readout stays shown.
+                if let Some(readout) = self.mem_sampler.sample(std::time::Instant::now()) {
+                    self.model.mem = Some(readout);
+                }
+                self.settle_super_release(std::time::Instant::now());
                 self.tick_overview(std::time::Instant::now());
                 self.animate_donut();
+                self.model.boot.advance(std::time::Instant::now());
                 self.model.stream.advance(std::time::Instant::now());
                 self.model.smooth.advance(std::time::Instant::now());
+                // A fling coasts on the frame clock, not on event arrival, so
+                // the travel stays smooth after the fingers leave the pad.
+                if self.model.has_momentum() {
+                    let max = self.max_scroll();
+                    self.model.apply_momentum(max);
+                }
                 let mut scene = Scene::new();
+                self.frame_meter.start();
                 if let Some(state) = self.state.as_mut() {
                     let scale = state.scale_factor();
                     let size = state.size();
@@ -1541,9 +1616,27 @@ impl ApplicationHandler for App {
                     let scale = state.scale_factor();
                     let size = state.size();
                     build_scene(&mut scene, &mut self.painter, &self.model, size, scale);
-                    if let Err(error) = state.render(&scene) {
+                    self.frame_meter.end_build();
+                    if let Err(error) = state.render(&scene, &mut self.frame_meter) {
                         eprintln!("render error: {error:#}");
                     }
+                }
+                // A continuous animation is paced by the display, not by the
+                // timer: ask for the next frame now and let the compositor's
+                // frame callback schedule it against the refresh. A timer
+                // wake (`WaitUntil` + `request_redraw` in `new_events`) beats
+                // against the refresh interval and skips a frame every few
+                // hundred milliseconds, which is exactly the intermittent
+                // hitch this replaces. Sparse animations (blink, spinner)
+                // keep the timer path, so an idle window still sleeps.
+                if self.wants_display_paced_frame(std::time::Instant::now()) {
+                    self.request_redraw();
+                } else {
+                    // No continuous frame is coming, so the next interval will
+                    // be however long the user waits before doing something.
+                    // Reporting that as a frame time would make every idle
+                    // window look like it dropped hundreds of frames.
+                    self.frame_meter.note_idle();
                 }
             }
             _ => {}

@@ -162,6 +162,11 @@ impl Config {
         {
             self.display.pin_images = parsed;
         }
+        if let Ok(v) = std::env::var("JCODE_PIN_TODOS")
+            && let Some(parsed) = parse_env_bool(&v)
+        {
+            self.display.pin_todos = parsed;
+        }
         if let Ok(v) = std::env::var("JCODE_DISPLAY_CENTERED") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.centered = parsed;
@@ -243,6 +248,11 @@ impl Config {
                 self.display.active_sessions_manager = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_EXTERNAL_SESSIONS") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.external_sessions = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_PERFORMANCE") {
             let trimmed = v.trim().to_lowercase();
             if matches!(trimmed.as_str(), "auto" | "full" | "reduced" | "minimal") {
@@ -307,6 +317,11 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_ENABLE_MERMAID") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.mermaid = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_AUTO_POKE") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.auto_poke = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_MESSAGE_TIMESTAMPS") {

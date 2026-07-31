@@ -68,6 +68,9 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
     let mut in_table = false;
     let mut table_row: Vec<String> = Vec::new();
     let mut table_rows: Vec<Vec<String>> = Vec::new();
+    // Per-column alignment from the delimiter row. Carried so a numeric column
+    // the author right-aligned is not silently re-read as left-aligned.
+    let mut table_alignments: Vec<jcode_render_core::Alignment> = Vec::new();
     let mut current_cell = String::new();
     let mut _is_header_row = false;
 
@@ -117,10 +120,15 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
                         _ => heading_color(),
                     };
 
+                    let underline = matches!(heading_level, Some(1) | Some(2));
                     let heading_spans: Vec<Span<'static>> = current_spans
                         .drain(..)
                         .map(|s| {
-                            Span::styled(s.content.to_string(), Style::default().fg(color).bold())
+                            let mut style = Style::default().fg(color).bold();
+                            if underline {
+                                style = style.underlined();
+                            }
+                            Span::styled(s.content.to_string(), style)
                         })
                         .collect();
                     lines.push(Line::from(heading_spans));
@@ -540,27 +548,16 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
                     }
                 } else {
                     ensure_blockquote_prefix(&mut current_spans, blockquote_depth);
+                    // Inline math must stay inline with the surrounding
+                    // sentence: image rendering is block-level, so even in
+                    // Image mode use the Unicode span. Standalone `$...$`
+                    // lines are already promoted to display math during
+                    // preprocessing and take the image path there.
                     match latex_mode {
                         LatexRenderingMode::None => current_spans.push(raw_math_inline_span(&math)),
-                        LatexRenderingMode::Unicode => current_spans.push(math_inline_span(&math)),
-                        LatexRenderingMode::Image
-                            if blockquote_depth == 0
-                                && list_stack.is_empty()
-                                && !in_definition_list
-                                && !in_footnote_definition =>
-                        {
-                            if let Some(image_lines) = latex_image_lines(&math, false, max_width) {
-                                flush_current_line_with_alignment(
-                                    &mut lines,
-                                    &mut current_spans,
-                                    None,
-                                );
-                                lines.extend(image_lines);
-                            } else {
-                                current_spans.push(math_inline_span(&math));
-                            }
+                        LatexRenderingMode::Unicode | LatexRenderingMode::Image => {
+                            current_spans.push(math_inline_span(&math));
                         }
-                        LatexRenderingMode::Image => current_spans.push(math_inline_span(&math)),
                     }
                 }
             }
@@ -873,7 +870,15 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
             }
 
             // Table handling
-            Event::Start(Tag::Table(_)) => {
+            Event::Start(Tag::Table(ref aligns)) => {
+                table_alignments = aligns
+                    .iter()
+                    .map(|align| match align {
+                        pulldown_cmark::Alignment::Right => jcode_render_core::Alignment::Right,
+                        pulldown_cmark::Alignment::Center => jcode_render_core::Alignment::Center,
+                        _ => jcode_render_core::Alignment::Left,
+                    })
+                    .collect();
                 dbg_tables += 1;
                 // Flush any pending content
                 flush_current_line_with_alignment(
@@ -893,7 +898,7 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
             Event::End(TagEnd::Table) => {
                 // Render the collected table
                 if !table_rows.is_empty() {
-                    let rendered = render_table(&table_rows, max_width);
+                    let rendered = render_table_aligned(&table_rows, max_width, &table_alignments);
                     lines.extend(rendered);
                     exit_centered_structured_block(&mut centered_blocks, lines.len());
                     if blockquote_depth == 0

@@ -31,6 +31,11 @@ pub struct Theme {
     pub rule: Color,
     /// Quiet fill for code blocks and wells.
     pub wash: Color,
+    /// Fill behind an *inline* code span. One density stronger than
+    /// [`Self::wash`], because a wash tuned for a whole block is too faint to
+    /// mark a single word inside a line of prose, and a code span you cannot
+    /// see is the same as no code span.
+    pub code_wash: Color,
     /// Fill of an input field. The composer is a field, not a code block, so
     /// it gets its own role: a grey slab reads as disabled, paper with a
     /// hairline reads as somewhere to type.
@@ -51,6 +56,13 @@ pub struct Theme {
     /// tuned to contrast with paper nearly vanishes on a wash, and a
     /// highlight you cannot see is the same as no highlight.
     pub selection_on_wash: Color,
+    /// Ink for an added line of a diff, and for a removed one. The one place
+    /// the print theme spends hue: a diff is read by scanning for which side a
+    /// line is on, and `+`/`-` alone makes that a character-by-character job.
+    /// Kept desaturated so a card full of them still reads as a document
+    /// rather than as a terminal.
+    pub added: Color,
+    pub removed: Color,
 }
 
 impl Theme {
@@ -64,31 +76,37 @@ impl Theme {
             faint: Color::from_rgb8(0x99, 0x99, 0x99),
             rule: Color::from_rgb8(0xcc, 0xcc, 0xcc),
             wash: Color::from_rgb8(0xf4, 0xf4, 0xf4),
+            code_wash: Color::from_rgb8(0xea, 0xea, 0xea),
             field: Color::from_rgb8(0xff, 0xff, 0xff),
             field_border: Color::from_rgb8(0xd4, 0xd4, 0xd4),
             field_border_focus: Color::from_rgb8(0x77, 0x77, 0x77),
             error: Color::from_rgb8(0x11, 0x11, 0x11),
             selection: Color::from_rgb8(0xd8, 0xd8, 0xd8),
             selection_on_wash: Color::from_rgb8(0xc4, 0xc4, 0xc4),
+            added: Color::from_rgb8(0x1a, 0x6b, 0x3a),
+            removed: Color::from_rgb8(0x9b, 0x22, 0x26),
         }
     }
 
-    /// Print language inverted: paper ink on near-black, same densities.
+    /// Print language inverted: paper ink on pure black, same densities.
     pub fn print_dark() -> Self {
         Self {
             mode: ThemeMode::Dark,
-            background: Color::from_rgb8(0x0e, 0x0e, 0x0e),
+            background: Color::from_rgb8(0x00, 0x00, 0x00),
             text: Color::from_rgb8(0xee, 0xee, 0xee),
             muted: Color::from_rgb8(0x99, 0x99, 0x99),
             faint: Color::from_rgb8(0x66, 0x66, 0x66),
             rule: Color::from_rgb8(0x33, 0x33, 0x33),
-            wash: Color::from_rgb8(0x1a, 0x1a, 0x1a),
-            field: Color::from_rgb8(0x16, 0x16, 0x16),
+            wash: Color::from_rgb8(0x14, 0x14, 0x14),
+            code_wash: Color::from_rgb8(0x24, 0x24, 0x24),
+            field: Color::from_rgb8(0x10, 0x10, 0x10),
             field_border: Color::from_rgb8(0x3a, 0x3a, 0x3a),
             field_border_focus: Color::from_rgb8(0x88, 0x88, 0x88),
             error: Color::from_rgb8(0xee, 0xee, 0xee),
             selection: Color::from_rgb8(0x3a, 0x3a, 0x3a),
             selection_on_wash: Color::from_rgb8(0x4c, 0x4c, 0x4c),
+            added: Color::from_rgb8(0x6d, 0xd4, 0x92),
+            removed: Color::from_rgb8(0xf0, 0x8b, 0x8b),
         }
     }
 
@@ -101,17 +119,64 @@ impl Theme {
         }
     }
 
-    /// Resolve from the environment: `JCODE_DESKTOP2_THEME=light|dark|system`.
-    pub fn from_env() -> Self {
-        let mode = match std::env::var("JCODE_DESKTOP2_THEME").as_deref() {
+    /// The mode asked for by `JCODE_DESKTOP2_THEME=light|dark|system`.
+    /// Kept separate from resolution so the app can remember that "system"
+    /// was requested and re-resolve when the system preference changes.
+    pub fn preference_from_env() -> ThemeMode {
+        match std::env::var("JCODE_DESKTOP2_THEME").as_deref() {
             Ok("dark") => ThemeMode::Dark,
             Ok("light") => ThemeMode::Light,
             _ => ThemeMode::System,
-        };
-        // System detection: honor common portals later; default light for now
-        // to match the website.
-        Self::for_mode(mode, false)
+        }
     }
+
+    /// Resolve from the environment: `JCODE_DESKTOP2_THEME=light|dark|system`.
+    pub fn from_env() -> Self {
+        Self::for_mode(Self::preference_from_env(), system_prefers_dark())
+    }
+}
+
+/// Whether the desktop asks for dark, read from the XDG settings portal.
+///
+/// The portal's `org.freedesktop.appearance color-scheme` key is the one
+/// cross-desktop source of truth (GNOME, KDE, niri via darkman all serve it),
+/// so it is asked first; `gsettings` covers a GNOME session without a portal.
+/// Both are asked through short-lived subprocesses rather than a D-Bus crate:
+/// this is one read at startup, not a protocol relationship, and a zbus
+/// dependency tree is a lot to carry for one integer. No answer means light,
+/// which matches the website.
+fn system_prefers_dark() -> bool {
+    // `busctl call` prints `v u 1` for prefer-dark, `v u 2` for prefer-light,
+    // and `v u 0` for no preference.
+    let portal = std::process::Command::new("busctl")
+        .args([
+            "--user",
+            "--timeout=1",
+            "call",
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            "ReadOne",
+            "ss",
+            "org.freedesktop.appearance",
+            "color-scheme",
+        ])
+        .output();
+    if let Ok(output) = portal
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return stdout.split_whitespace().last() == Some("1");
+    }
+    let gsettings = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output();
+    if let Ok(output) = gsettings
+        && output.status.success()
+    {
+        return String::from_utf8_lossy(&output.stdout).contains("dark");
+    }
+    false
 }
 
 impl Default for Theme {

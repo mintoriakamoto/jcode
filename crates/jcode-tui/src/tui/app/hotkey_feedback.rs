@@ -289,6 +289,11 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
         "scroll_bookmark",
         "toggle the scroll bookmark",
     );
+    out.push(KnownHotkey::new(
+        ctrl('l'),
+        "clear_view",
+        "clear the view, keeping context (/cls)",
+    ));
 
     // Built-in readline-style editing chords.
     out.push(KnownHotkey::new(
@@ -359,8 +364,8 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
     ));
     out.push(KnownHotkey::new(
         ctrl('r'),
-        "recover_session",
-        "recover the session without tools",
+        "history_search",
+        "search prompt history across sessions",
     ));
     out.push(KnownHotkey::new(
         key(KeyCode::Enter, KeyModifiers::CONTROL),

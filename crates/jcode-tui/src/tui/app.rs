@@ -53,6 +53,7 @@ mod auth;
 mod auth_account_picker_saved_accounts;
 mod catchup;
 mod commands;
+mod commands_colors;
 mod commands_dispatch;
 mod commands_improve;
 mod commands_overnight;
@@ -67,6 +68,7 @@ mod event_wrappers;
 mod handterm_native_scroll;
 pub(crate) mod helpers;
 mod hotkey_feedback;
+pub(crate) mod idle_animation_repaint;
 mod idle_heap_release;
 mod inline_interactive;
 mod input;
@@ -81,6 +83,7 @@ mod onboarding_flow_control;
 mod onboarding_repair;
 mod onboarding_sim;
 mod productivity;
+mod prompt_history;
 mod remote;
 mod remote_notifications;
 mod replay;
@@ -88,7 +91,6 @@ pub(crate) mod run_shell;
 mod runtime_memory;
 mod shortcut_hints;
 mod split_view;
-mod sponsor_disclosure;
 mod state_ui;
 mod state_ui_input_helpers;
 pub(crate) use state_ui_input_helpers::registered_command_entries;
@@ -100,6 +102,7 @@ mod subscribe_nudge;
 mod support;
 mod swarm_hint;
 mod terminal_liveness;
+mod terminal_setup_command;
 mod todos_view;
 mod tui_lifecycle;
 mod tui_lifecycle_runtime;
@@ -884,6 +887,14 @@ pub struct App {
     context_revision: u64,
     // Track last streaming activity for "stale" detection
     last_stream_activity: Option<Instant>,
+    // When the user last pressed a key, mouse-scrolled, or pasted.
+    //
+    // Distinct from `last_stream_activity`, which tracks *provider* output: a
+    // user typing into an idle session produces no stream events at all, so that
+    // field cannot tell "actively composing" from "sitting untouched". The redraw
+    // scheduler needs the difference so it can keep the decorative animation out
+    // of the way of keystrokes.
+    last_user_interaction: Option<Instant>,
     // Provider has emitted MessageEnd, but the turn is still finalizing bookkeeping.
     stream_message_ended: bool,
     // A remote Done received while paced text is still buffered. The redraw
@@ -1306,6 +1317,19 @@ pub struct App {
     /// Hash of the todo payload rendered into the inline chat todo card, used
     /// to keep the card live-updating while it stays in the transcript.
     todo_card_rendered_hash: u64,
+    /// JSON payload for the pinned todo band (display.pin_todos). `None` when
+    /// the feature is off or the session has no todos. Refreshed on tick.
+    /// The renderer wiring for these three fields is landing separately, so
+    /// they are allowed to be unread until it does.
+    #[allow(dead_code)]
+    pinned_todos_payload: Option<String>,
+    /// Hash of the todo payload behind `pinned_todos_payload`, used to skip
+    /// re-serializing when nothing changed between ticks.
+    #[allow(dead_code)]
+    pinned_todos_rendered_hash: u64,
+    /// Last time the pinned todo band re-read todos from disk (1s throttle).
+    #[allow(dead_code)]
+    pinned_todos_checked_at: Option<Instant>,
     last_side_panel_refresh: Option<Instant>,
     // Most recently persisted focus target for dictation routing.
     last_client_focus_recorded_at: Option<Instant>,
@@ -1399,6 +1423,10 @@ pub struct App {
     open_resume_key: OptionalBinding,
     // Optional configured keybinding for accepting the post-error fallback offer
     fallback_switch_key: OptionalBinding,
+    // Config reload generation the keybinding snapshot above was parsed at.
+    // Polled on idle ticks so config.toml keybinding edits hot-reload
+    // without a restart.
+    keybindings_config_generation: u64,
     // Active external dictation session, if one is running
     dictation_session: Option<dictation::ActiveDictation>,
     // Whether an external dictation command is currently running
@@ -1423,10 +1451,9 @@ pub struct App {
     learn_hint: Option<(String, Instant)>,
     // Whether a learned-keybinding nudge has already been surfaced this session.
     learn_hint_shown_this_session: bool,
+    terminal_setup_hint_shown_this_session: bool,
     // Whether the swarm-config-is-a-prompt hint has been surfaced this session.
     swarm_hint_shown_this_session: bool,
-    // Sponsored-discovery disclosure shown yet (once per session).
-    sponsor_disclosure_shown_this_session: bool,
     subscribe_nudge: subscribe_nudge::SubscribeNudgeState,
     // Inline hotkey feedback: "pressed X → does Y" for rare known chords or
     // "X isn't bound · nearest: ..." for unknown; same slot as learn_hint.
@@ -1448,6 +1475,8 @@ pub struct App {
     active_experimental_feature_notice: Option<String>,
     // Message to interleave during processing (set via Ctrl+Enter in queue mode)
     interleave_message: Option<String>,
+    // Image attachments associated with the staged interleave message.
+    interleave_images: Vec<(String, String)>,
     // Message sent as soft interrupt but not yet injected (shown in queue preview until injected)
     pending_soft_interrupts: Vec<String>,
     // Soft interrupts written to the socket but not yet acknowledged by the server.
@@ -1591,6 +1620,11 @@ pub struct App {
     /// Per-client Niri-style workspace navigation state. Previously a process
     /// global; now owned per App instance.
     workspace_client: super::workspace_client::WorkspaceClientState,
+    /// Reverse prompt-history search overlay state (Ctrl+R). None = closed.
+    prompt_history_search: Option<prompt_history::PromptHistorySearchState>,
+    /// Lazily-loaded persisted cross-session prompt history (oldest first,
+    /// deduped). None until first use; see `prompt_history.rs`.
+    persisted_prompt_history: Option<Vec<String>>,
 }
 
 /// Inert provider used by runtime modes whose output is supplied by another source.

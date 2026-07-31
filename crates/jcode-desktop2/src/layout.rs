@@ -43,18 +43,22 @@ pub const FOOTNOTE_GAP: f64 = 6.0;
 pub const STRIP_HEIGHT: f64 = 14.0;
 /// Gap between the strip and the transcript below it.
 pub const STRIP_GAP: f64 = 10.0;
-/// Caption size for the strip's group labels.
-pub const STRIP_LABEL_SIZE: f32 = 10.0;
-/// Width of one session bar, and the gap between bars in a group. Tuned to
+/// Width of one session block, and the gap between blocks in a group. Tuned to
 /// read as the `|` ticks of the waybar module rather than as buttons.
 pub const STRIP_BAR_WIDTH: f64 = 2.0;
-/// The focused bar is drawn wider, standing in for the module's `█` glyph.
+/// The focused block is drawn wider, standing in for the module's `█` glyph.
 pub const STRIP_BAR_FOCUS_WIDTH: f64 = 6.0;
 pub const STRIP_BAR_GAP: f64 = 3.0;
-/// Height of a bar within the strip row.
-pub const STRIP_BAR_HEIGHT: f64 = 10.0;
-/// Gap between a group's label and its first bar.
-pub const STRIP_LABEL_GAP: f64 = 6.0;
+/// Height of a block within the strip row.
+pub const STRIP_BAR_HEIGHT: f64 = 8.0;
+/// Padding between a group's outline and the blocks inside it. The outline is
+/// what names the group now that no text does, so it needs enough air to read
+/// as an enclosure rather than as a border on the first block. Blocks plus this
+/// padding on both sides must stay inside `STRIP_HEIGHT`, or the enclosure
+/// bleeds into the transcript's gap; `strip_owns_its_band` pins that.
+pub const STRIP_FRAME_PAD: f64 = 2.0;
+/// Corner radius of a group outline.
+pub const STRIP_FRAME_RADIUS: f64 = 2.0;
 /// Gap between one group and the next.
 pub const STRIP_GROUP_GAP: f64 = 16.0;
 /// The hero donut's side, in logical units. Matches the website's 360px hero
@@ -65,19 +69,33 @@ pub const STRIP_GROUP_GAP: f64 = 16.0;
 pub const DONUT_SIDE: f64 = 360.0;
 /// Hero wordmark over the donut, as on the website's landing section.
 pub const HERO_WORDMARK_SIZE: f32 = 34.0;
-/// Gap under the wordmark, and under the donut before the tagline.
-pub const HERO_GAP: f64 = 14.0;
+/// Clear space under the wordmark, and under the donut before the tagline.
+/// Measured from painted ink to painted ink, not from box to box, so it is the
+/// gap the eye actually sees. Roughly half the wordmark's size, which is the
+/// smallest gap that still reads as "separate thing" rather than "touching".
+pub const HERO_GAP: f64 = 18.0;
 /// Line height for hero text. Tight, because the hero stacks single lines
 /// against a graphic: body leading would put invisible slack above each line
 /// and make the measured gaps disagree with the optical ones.
 pub const HERO_LINE_HEIGHT: f32 = 1.15;
 /// Tagline under the donut: the one line that says what this is.
 pub const HERO_TAGLINE_SIZE: f32 = 12.5;
-/// Fraction of the donut's square its silhouette actually inks. The torus at
-/// this tilt does not reach the corners or the top and bottom edges, so laying
-/// the stack out on the raw square leaves a gap that looks like a mistake; the
-/// wordmark and tagline are spaced against the *visible* disc instead.
-pub const DONUT_INK_FRACTION: f64 = 0.82;
+/// Fraction of the donut's square its silhouette actually inks vertically, at
+/// the *widest* point of the tilt wobble. The torus at this tilt does not reach
+/// the square's top and bottom edges, so laying the stack out on the raw square
+/// leaves a gap that looks like a mistake; the wordmark and tagline are spaced
+/// against the *visible* disc instead. This is the worst case over the whole
+/// animation, not the average: spacing against the average lets the disc grow
+/// into the gap on the frames where it is tallest, which is exactly when the
+/// text looks touched. Measured by `donut::tests::ink_extent_is_stable_across_
+/// the_wobble`.
+pub const DONUT_INK_FRACTION: f64 = 0.88;
+/// The halftone screen paints a *disc* centred on each sampled cell, so the
+/// painted silhouette reaches about one dot radius further than the cell grid
+/// [`DONUT_INK_FRACTION`] measures. Counted as part of the donut so the gap the
+/// eye sees is the gap the layout asked for. See `scene`'s `DOT_PITCH` and
+/// `DOT_FILL`: 360/76 * 0.62 rounded up.
+pub const DONUT_DOT_BLEED: f64 = 3.0;
 /// Smallest square that still reads as a donut at [`DOT_PITCH`]. Nothing is
 /// drawn between this and [`DONUT_SIDE`] now that the hero is fixed size, but
 /// the renderer and the hit test keep it as their floor so a degenerate box
@@ -101,6 +119,41 @@ pub struct Hero {
     /// Top of the tagline line under the donut.
     pub tagline_top: f64,
 }
+
+/// The empty band between one edge of the donut's square and the nearest
+/// painted dot, at the tallest point of the wobble. The stack's gaps are laid
+/// against this, so `HERO_GAP` is optical clearance rather than box padding.
+pub fn donut_bleed(side: f64) -> f64 {
+    (side * (1.0 - DONUT_INK_FRACTION) / 2.0 - DONUT_DOT_BLEED).max(0.0)
+}
+
+/// Height of the hero stack as laid on the page: the wordmark, the donut's
+/// *inked* disc (the square's empty bleed bands are not demanded), and the
+/// tagline, with their gaps. One definition shared by [`Frame::hero`]'s fit
+/// check and [`Frame::resolve`]'s reservation, so the two can never disagree
+/// about whether the stack fits.
+fn hero_stack_height() -> f64 {
+    let wordmark = f64::from(HERO_WORDMARK_SIZE * HERO_LINE_HEIGHT);
+    let tagline = f64::from(HERO_TAGLINE_SIZE * HERO_LINE_HEIGHT);
+    let bleed = donut_bleed(DONUT_SIDE);
+    DONUT_SIDE - bleed * 2.0 + wordmark + tagline + HERO_GAP * 2.0
+}
+
+/// The transcript height [`Frame::resolve`] reserves for the hero on an empty
+/// session. A hair over the stack itself, so floating-point placement cannot
+/// round the available space to just under the stack and silently drop it.
+fn hero_reservation() -> f64 {
+    hero_stack_height() + 0.5
+}
+
+/// Slack allowed when judging whether the hero stack fits, in logical pixels.
+///
+/// The stack's top and bottom edges are whitespace (a gap and the disc's soft
+/// silhouette), so a region a couple of pixels short of the stack loses
+/// nothing visible. Without this, a page whose composer ceiling lands a
+/// fraction of a pixel under the reservation drops the whole hero over slack
+/// nobody can see.
+const HERO_FIT_SLACK: f64 = 2.0;
 
 /// Resolved geometry for one frame. All fields are logical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -165,21 +218,38 @@ impl Frame {
         // placed. Resolve it on a probe frame first, then rebuild with the
         // real top so a growing transcript pushes the well down correctly.
         let strip_offset = if strip { STRIP_HEIGHT + STRIP_GAP } else { 0.0 };
-        let mut frame = Self::with_composer_lines_and_content(
-            size,
-            scale,
-            lines,
-            content_height + strip_offset,
-        );
-        // The strip takes its row out of the transcript's top margin, which is
-        // dead space anyway, and only when there is something to show. Nothing
-        // is reserved otherwise, so a single-session window is byte-identical
-        // to one built before the strip existed.
-        if strip {
-            frame.strip_top = Some(frame.body_top);
-            frame.body_top = (frame.body_top + STRIP_HEIGHT + STRIP_GAP).min(frame.body_bottom);
+        let build = |content: f64| {
+            let mut frame = Self::with_composer_lines_and_content(size, scale, lines, content);
+            // The strip takes its row out of the transcript's top margin, which
+            // is dead space anyway, and only when there is something to show.
+            // Nothing is reserved otherwise, so a single-session window is
+            // byte-identical to one built before the strip existed.
+            if strip {
+                frame.strip_top = Some(frame.body_top);
+                frame.body_top = (frame.body_top + STRIP_HEIGHT + STRIP_GAP).min(frame.body_bottom);
+            }
+            frame
+        };
+        if content_height > 0.0 {
+            return build(content_height + strip_offset);
         }
-        frame
+        // An empty session is the hero's page, so reserve its stack the same
+        // way a transcript reserves its height: the composer sits just under
+        // the wordmark/donut/tagline column, exactly like the input under the
+        // website's landing hero. Centring the composer instead starved the
+        // hero of room on ordinary laptop windows (a 720-tall page has ~280
+        // logical pixels above a centred well; the stack needs ~377), which
+        // silently dropped the donut at the default window size.
+        //
+        // Checked against the built frame's own `hero()` rather than by
+        // repeating its fit arithmetic here: the two can then never disagree.
+        // A window too short or too narrow for the stack falls back to the
+        // centred composer with no hero, as before.
+        let reserved = build(hero_reservation() + strip_offset);
+        if reserved.hero().is_some() {
+            return reserved;
+        }
+        build(strip_offset)
     }
 
     /// Resolve geometry with a composer sized for `lines` of input. The
@@ -187,7 +257,7 @@ impl Frame {
     /// being clipped, and stops growing at [`COMPOSER_MAX_LINES`] so a long
     /// paste can never push the transcript off the page.
     pub fn with_composer_lines(size: (u32, u32), scale: f64, lines: usize) -> Self {
-        Self::with_composer_lines_and_content(size, scale, lines, 0.0)
+        Self::resolve(size, scale, lines, false, 0.0)
     }
 
     /// As [`Self::with_composer_lines`], with the measured height of the
@@ -332,21 +402,19 @@ impl Frame {
     pub fn hero(&self) -> Option<Hero> {
         let available = self.body_bottom - self.body_top;
         let wordmark_height = f64::from(HERO_WORDMARK_SIZE * HERO_LINE_HEIGHT);
-        let tagline_height = f64::from(HERO_TAGLINE_SIZE * HERO_LINE_HEIGHT);
-        let chrome = wordmark_height + tagline_height + HERO_GAP * 2.0;
         // Fixed side: the hero either fits at its one true size or is not
         // drawn. Fitting it by scaling made the donut jump whenever the frame
         // changed height, e.g. when the top chrome row appeared.
         let side = DONUT_SIDE;
         // Space the text against the inked disc, not the square, then centre
         // the whole stack in the region like the website's flexbox.
-        let bleed = side * (1.0 - DONUT_INK_FRACTION) / 2.0;
-        let total = side - bleed * 2.0 + chrome;
+        let bleed = donut_bleed(side);
         // Fit is judged on the inked stack, not the raw square: the square's
         // top and bottom `bleed` bands are empty, so demanding room for them
         // would drop the hero on ordinary laptop windows for the sake of
         // whitespace.
-        if total > available || self.column() < side {
+        let total = hero_stack_height();
+        if total > available + HERO_FIT_SLACK || self.column() < side {
             return None;
         }
         let top = self.body_top + (available - total) / 2.0;
@@ -540,8 +608,12 @@ mod tests {
 
     #[test]
     fn the_composer_grows_with_its_line_count() {
-        let one = Frame::with_composer_lines((1100, 720), 1.0, 1);
-        let three = Frame::with_composer_lines((1100, 720), 1.0, 3);
+        // A window too short for the hero keeps the original centred layout:
+        // the well grows symmetrically about the page's middle line.
+        let size = (1100, 480);
+        let one = Frame::with_composer_lines(size, 1.0, 1);
+        assert!(one.hero().is_none(), "this size must not hold a hero");
+        let three = Frame::with_composer_lines(size, 1.0, 3);
         assert!(
             three.composer_top < one.composer_top,
             "the composer did not grow for more lines"
@@ -559,6 +631,20 @@ mod tests {
         assert!(
             three.body_bottom < one.body_bottom,
             "the transcript did not yield space to the composer"
+        );
+
+        // On a hero page the well's top is seated under the stack, so growth
+        // goes downward: the hero must not be squeezed by a longer input.
+        let one = Frame::with_composer_lines((1100, 720), 1.0, 1);
+        assert!(one.hero().is_some(), "the default window must hold a hero");
+        let three = Frame::with_composer_lines((1100, 720), 1.0, 3);
+        assert_eq!(
+            one.composer_top, three.composer_top,
+            "a longer input moved the hero page's composer top"
+        );
+        assert!(
+            three.composer_bottom > one.composer_bottom,
+            "the composer did not grow for more lines on the hero page"
         );
     }
 
@@ -579,8 +665,12 @@ mod tests {
                     let clamped_low =
                         frame.body_bottom - frame.body_top <= frame.body_line_height() + 0.001;
                     let clamped_high = frame.footnote_bottom >= frame.height - 40.0 - 0.001;
+                    // An empty session seats the well under the hero stack when
+                    // the stack does not fit above the centre line; that only
+                    // ever moves the well *down*, like a transcript would.
+                    let hero_seated = frame.hero().is_some() && center > page;
                     assert!(
-                        (center - page).abs() < 0.001 || clamped_low || clamped_high,
+                        (center - page).abs() < 0.001 || clamped_low || clamped_high || hero_seated,
                         "composer centre {center} left the page middle {page} unclamped at {}x{}",
                         frame.width,
                         frame.height
@@ -657,9 +747,17 @@ mod tests {
         for &size in &[(1100u32, 720u32), (1440, 900), (1920, 1080), (2560, 1440)] {
             let frame = Frame::with_composer_lines(size, 1.0, 1);
             let center = (frame.composer_top + frame.composer_bottom) / 2.0;
+            let centred = (center - frame.height / 2.0).abs() < 0.001;
+            // A roomy page is also a hero page: when the stack does not fit
+            // above the centre line, the well is seated exactly under the
+            // reserved stack instead. Anything else is drift.
+            let seated = (frame.composer_top
+                - (frame.body_top + hero_reservation() + SPACE_BEFORE_COMPOSER))
+                .abs()
+                < 0.001;
             assert!(
-                (center - frame.height / 2.0).abs() < 0.001,
-                "composer was not centred at {}x{}: {center}",
+                centred || seated,
+                "composer neither centred nor seated under the hero at {}x{}: {center}",
                 frame.width,
                 frame.height
             );

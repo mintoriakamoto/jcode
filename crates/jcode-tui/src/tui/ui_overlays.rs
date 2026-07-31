@@ -495,6 +495,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     ));
     lines.push(key_entry("Ctrl+H / Ctrl+L", "Focus chat / diagram / diffs"));
     lines.push(key_entry(
+        "Ctrl+L",
+        "Clear the view, keep context (/cls; no pane focused)",
+    ));
+    lines.push(key_entry(
         "Ctrl+Left / Right",
         "Cycle diagrams (when diagram focused)",
     ));
@@ -558,12 +562,19 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Insert newline in input",
     ));
     lines.push(key_entry(
+        "Trailing \\ then Enter",
+        "Insert newline (fallback; run /terminal-setup to fix Shift+Enter)",
+    ));
+    lines.push(key_entry(
         "Ctrl+Enter / Cmd+Enter",
         "Use opposite send mode while processing",
     ));
     lines.push(key_entry("Ctrl+Up", "Retrieve pending message for editing"));
     lines.push(key_entry("Ctrl+Tab / Ctrl+T", "Toggle queue mode"));
-    lines.push(key_entry("Ctrl+R", "Recover from missing tool outputs"));
+    lines.push(key_entry(
+        "Ctrl+R",
+        "Search prompt history (across sessions)",
+    ));
     lines.push(key_entry(
         &format!("Ctrl+V / {}", alt("V")),
         "Paste clipboard (text or image)",

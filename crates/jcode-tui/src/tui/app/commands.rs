@@ -522,6 +522,7 @@ pub(super) fn handle_transfer_command_local(app: &mut App) {
     app.pending_transfer_request = true;
     if app.is_processing {
         app.interleave_message = Some(transfer_pause_message());
+        app.interleave_images.clear();
         app.push_display_message(DisplayMessage::system(
             "Queued /transfer. The current session will be asked to pause, then the compacted handoff will open in a new window."
                 .to_string(),
@@ -830,6 +831,7 @@ pub(super) fn handle_cancel_command(app: &mut App, trimmed: &str) -> bool {
     if app.is_processing {
         app.cancel_requested = true;
         app.interleave_message = None;
+        app.interleave_images.clear();
         app.pending_soft_interrupts.clear();
         app.pending_soft_interrupt_requests.clear();
         if app.cancel_overnight_for_interrupt() {
@@ -1633,6 +1635,7 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     if handle_subagent_model_command(app, trimmed)
         || app.handle_hotkeys_command(trimmed)
+        || app.handle_terminal_setup_command(trimmed)
         || handle_subagent_command(app, trimmed)
         || handle_observe_command(app, trimmed)
         || handle_todos_view_command(app, trimmed)
@@ -1721,6 +1724,11 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
 
     if trimmed == "/clear" {
         reset_current_session(app);
+        return true;
+    }
+
+    if trimmed == "/cls" || trimmed == "/clear-view" {
+        app.clear_view_keep_context();
         return true;
     }
 
@@ -2624,12 +2632,10 @@ fn weighted_confidence_average(scores: impl IntoIterator<Item = (u8, u32)>) -> O
 
 pub(super) fn build_todo_confidence_summary_message(todos: &[crate::todo::TodoItem]) -> String {
     let summary = todo_confidence_summary(todos);
-    if summary.completion_confidence_needs_validation {
-        TODO_COMPLETION_CONTINUATION_MESSAGE.to_string()
-    } else if summary.confidence_spike_detected {
-        TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE.to_string()
+    if summary.confidence_spike_detected && !summary.completion_confidence_needs_validation {
+        crate::todo::build_todo_confidence_spike_continuation_message(todos)
     } else {
-        TODO_COMPLETION_CONTINUATION_MESSAGE.to_string()
+        crate::todo::build_todo_completion_continuation_message(todos)
     }
 }
 

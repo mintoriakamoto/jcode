@@ -192,6 +192,38 @@ fn tool_output_to_content_blocks_preserves_labeled_images() {
 }
 
 #[tokio::test]
+async fn queued_soft_interrupt_images_are_injected_as_image_blocks() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = Agent::new(provider, registry);
+
+    agent.queue_soft_interrupt(
+        "look at this".to_string(),
+        vec![("image/png".to_string(), "ZmFrZQ==".to_string())],
+        false,
+        SoftInterruptSource::User,
+    );
+    let injected = agent.inject_soft_interrupts();
+
+    assert_eq!(injected.len(), 1);
+    let message = agent
+        .session
+        .messages
+        .last()
+        .expect("soft interrupt should append a user message");
+    assert!(matches!(
+        &message.content[0],
+        ContentBlock::Image { media_type, data }
+            if media_type == "image/png" && data == "ZmFrZQ=="
+    ));
+    assert!(matches!(
+        &message.content[1],
+        ContentBlock::Text { text, .. } if text == "look at this"
+    ));
+}
+
+#[tokio::test]
 async fn run_turn_streaming_mpsc_emits_keepalive_while_provider_is_quiet() {
     let _guard = crate::storage::lock_test_env();
     let provider: Arc<dyn Provider> = Arc::new(DelayedProvider {
@@ -747,6 +779,7 @@ fn seed_transient_session_state(agent: &mut Agent) {
     agent.push_alert("pending alert".to_string());
     agent.queue_soft_interrupt(
         "queued interrupt".to_string(),
+        Vec::new(),
         true,
         SoftInterruptSource::User,
     );
@@ -1014,6 +1047,7 @@ async fn mark_closed_persists_soft_interrupts_for_restore_after_reload() {
     agent.session.save().expect("save active session");
     agent.queue_soft_interrupt(
         "resume me after reload".to_string(),
+        Vec::new(),
         true,
         SoftInterruptSource::System,
     );
@@ -1378,6 +1412,76 @@ fn guardrail_notice_absent_for_normal_turns() {
     // Normal turn with visible text: no notice.
     assert!(Agent::provider_guardrail_notice(Some("end_turn"), false, false).is_none());
     assert!(Agent::provider_guardrail_notice(None, false, true).is_none());
+}
+
+#[test]
+fn empty_turn_log_event_separates_guardrails_from_transient_empties() {
+    assert_eq!(
+        Agent::empty_turn_log_event(Some("refusal")),
+        "PROVIDER_GUARDRAIL"
+    );
+    assert_eq!(
+        Agent::empty_turn_log_event(Some("content_filter")),
+        "PROVIDER_GUARDRAIL"
+    );
+    assert_eq!(
+        Agent::empty_turn_log_event(Some("stop")),
+        "PROVIDER_EMPTY_RESPONSE"
+    );
+    assert_eq!(Agent::empty_turn_log_event(None), "PROVIDER_EMPTY_RESPONSE");
+}
+
+#[test]
+fn guardrail_notice_for_transient_empty_does_not_blame_content_filter() {
+    let notice = Agent::provider_guardrail_notice(Some("stop"), true, false)
+        .expect("empty visible output must produce a notice");
+    assert!(
+        !notice.contains("usually a provider-side guardrail"),
+        "transient empty responses must not be blamed on a guardrail: {notice}"
+    );
+    assert!(notice.contains("empty response"), "{notice}");
+}
+
+#[tokio::test]
+async fn empty_post_tool_response_is_retried_in_shared_helper() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let mut attempts = 0u32;
+    // Empty response right after tool results: inject continuation.
+    let retried = agent
+        .maybe_continue_empty_post_tool_response(true, true, Some("stop"), &mut attempts)
+        .expect("helper must not error");
+    assert!(retried);
+    assert_eq!(attempts, 1);
+
+    // A guardrail refusal is deliberate and must not be retried.
+    let retried = agent
+        .maybe_continue_empty_post_tool_response(true, true, Some("refusal"), &mut attempts)
+        .expect("helper must not error");
+    assert!(!retried);
+
+    // Visible output or no recent tool result: no retry.
+    assert!(
+        !agent
+            .maybe_continue_empty_post_tool_response(false, true, Some("stop"), &mut attempts)
+            .unwrap()
+    );
+    assert!(
+        !agent
+            .maybe_continue_empty_post_tool_response(true, false, Some("stop"), &mut attempts)
+            .unwrap()
+    );
+
+    // Retry budget is bounded.
+    attempts = Agent::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS;
+    assert!(
+        !agent
+            .maybe_continue_empty_post_tool_response(true, true, Some("stop"), &mut attempts)
+            .unwrap()
+    );
 }
 
 include!("agent_tests/retention_readiness.rs");

@@ -148,7 +148,7 @@ carry `x-jcode-discovery-benchmark: 1`, and the corresponding telemetry event ha
 | `total_tokens` | `23223` | Sum of input, output, cache-read, and cache-creation tokens |
 | `feature_*_used` | `true/false` | Whether a feature family was used (memory, swarm, web, email, MCP, side panel, goals, todos, selfdev, background, subagents) |
 | `tool_cat_*` | `0..N` | Coarse tool category counts (read/search, write, shell, web, memory, subagent, swarm, email, side-panel, goal, todo, MCP, other) |
-| `todo_gate_*_count` | `0..N` | How often todo quality gates fired in-session (end-to-end ownership, hill-climbability, completion confidence, confidence spike) |
+| `todo_gate_*_count` | `0..N` | How often todo quality gates fired in-session (end-to-end ownership, closed feedback loop, completion confidence, confidence spike) |
 | `command_*_used` | `true/false` | Whether a slash-command family was used in-session |
 | `workflow_*_used` | `true/false` | Whether the session looked like coding, research, testing, background, subagent, or swarm work |
 | `unique_mcp_servers` | `2` | Count of distinct MCP servers touched in-session |
@@ -238,10 +238,27 @@ Most events also carry a few coarse quality / cleanup fields:
 - No file paths, project names, or directory structures
 - No tool inputs or tool outputs
 - No MCP server names or configurations
-- No IP addresses (Cloudflare Workers don't log these by default)
+- No IP addresses (the worker never reads or stores the client IP)
+- No city, region, coordinates, postal code, or timezone
 - No personal information of any kind
 - No error messages or stack traces in telemetry (only coarse categories and end reasons)
 - No exact wall-clock timestamps beyond coarse hour-of-day / weekday buckets
+
+### Coarse Geography (added by the receiving worker, not the client)
+
+The telemetry worker records a single **2-letter country code**, resolved by
+Cloudflare at the edge from the connection (`request.cf.country`). jcode itself
+never collects, computes, or sends location data, and the value cannot be set or
+spoofed by the client.
+
+| Field | Example | Purpose |
+|-------|---------|----------|
+| `country` | `"DE"` | Aggregate "which countries do users come from" reporting |
+
+Only the country is kept: the IP address, city, region, coordinates, postal
+code, and timezone are never read or stored. It is stored as a per-day
+aggregate (`country_daily` counts) plus a `last_country` column on the daily
+active-user rollup. Unknown (`XX`) and Tor (`T1`) codes are discarded.
 
 The UUID is randomly generated on first run and stored at `~/.jcode/telemetry_id`. It is not derived from your machine, username, email, or any identifiable information.
 

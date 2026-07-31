@@ -62,7 +62,7 @@ impl App {
             }
             if let Some(summary) = self.summarize_tool_results_missing() {
                 let message = format!(
-                    "Tool outputs are missing for this turn. {}\n\nPress Ctrl+R to recover into a new session with context copied.",
+                    "Tool outputs are missing for this turn. {}\n\nRun /fix to recover into a new session with context copied.",
                     summary
                 );
                 self.push_display_message(DisplayMessage::error(message));
@@ -571,8 +571,6 @@ impl App {
                                             if tool.name == "swarm" {
                                                 self.maybe_surface_swarm_config_hint();
                                             }
-                                            let sponsor_disclosure_title =
-                                                self.inline_sponsor_disclosure_title(&tool);
                                             if let Some(streaming_tool) = self
                                                 .streaming_tool_calls
                                                 .iter_mut()
@@ -593,7 +591,7 @@ impl App {
                                                 content: tool.name.clone(),
                                                 tool_calls: vec![],
                                                 duration_secs: None,
-                                                title: sponsor_disclosure_title,
+                                                title: None,
                                                 tool_data: Some(tool.clone()),
                                             });
 

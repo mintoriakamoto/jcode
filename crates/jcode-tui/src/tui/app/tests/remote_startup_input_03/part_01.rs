@@ -664,6 +664,8 @@ fn test_startup_update_checking_stays_quiet_until_update_work_starts() {
 
     app.handle_update_status(UpdateStatus::Downloading {
         version: "v1.2.3".to_string(),
+        downloaded: 512 * 1024,
+        total: Some(1024 * 1024),
     });
 
     let update_cards = app
@@ -677,11 +679,15 @@ fn test_startup_update_checking_stays_quiet_until_update_work_starts() {
         .last()
         .expect("expected update display message");
     assert!(message.content.contains("Status: downloading v1.2.3"));
-    assert!(message.content.contains("restart automatically"));
-    assert_eq!(
-        app.status_notice(),
-        Some("Updating to v1.2.3...".to_string())
+    assert!(
+        message.content.contains("50%"),
+        "download card should show progress: {}",
+        message.content
     );
+    assert!(message.content.contains("reload in place"));
+    let notice = app.status_notice().expect("expected download notice");
+    assert!(notice.starts_with("Updating to v1.2.3..."));
+    assert!(notice.contains("50%"), "notice should show progress: {notice}");
 
     app.handle_update_status(UpdateStatus::Installed {
         version: "v1.2.3".to_string(),
@@ -696,6 +702,38 @@ fn test_startup_update_checking_stays_quiet_until_update_work_starts() {
     assert_eq!(
         app.status_notice(),
         Some("Updated to v1.2.3; restarting...".to_string())
+    );
+}
+
+/// The user-facing complaint behind the progress work: update output used to
+/// churn the transcript and clobber the input line. A streaming download must
+/// keep exactly one Update card (updated in place), never grow the message
+/// list, and never touch the input buffer.
+#[test]
+fn test_startup_update_progress_stream_does_not_churn_transcript_or_input() {
+    let mut app = create_test_app();
+    app.set_input_for_test("draft the user was typing".to_string());
+    let baseline_messages = app.display_messages().len();
+
+    for downloaded in [0u64, 256, 512, 768, 1024].map(|kib| kib * 1024) {
+        app.handle_update_status(UpdateStatus::Downloading {
+            version: "v1.2.3".to_string(),
+            downloaded,
+            total: Some(1024 * 1024),
+        });
+    }
+
+    assert_eq!(
+        app.display_messages().len(),
+        baseline_messages + 1,
+        "streamed progress must reuse one card, not append per event"
+    );
+    let card = app.display_messages().last().expect("update card");
+    assert!(card.content.contains("100%"), "card shows latest progress");
+    assert_eq!(
+        app.input(),
+        "draft the user was typing",
+        "update progress must never clobber the input line"
     );
 }
 

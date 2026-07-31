@@ -13,6 +13,9 @@ type NodeBuilder = fn() -> Model;
 pub const NODES: &[(&str, NodeBuilder)] = &[
     ("connecting", connecting),
     ("attached_empty", attached_empty),
+    ("boot_opening", boot_opening),
+    ("boot_donut", boot_donut),
+    ("boot_chrome", boot_chrome),
     ("donut_dragged", donut_dragged),
     ("donut_off", donut_off),
     ("mid_input", mid_input),
@@ -29,16 +32,25 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("streaming", streaming),
     ("reasoning", reasoning),
     ("reasoning_streaming", reasoning_streaming),
+    ("reasoning_paragraphs", reasoning_paragraphs),
     ("tool_progress", tool_progress),
+    ("background_progress", background_progress),
+    ("background_progress_many", background_progress_many),
+    ("edit_card", edit_card),
+    ("edit_cards_many", edit_cards_many),
     ("working", working),
+    ("queued_message", queued_message),
     ("turn_done", turn_done),
     ("transcript_selection", transcript_selection),
     ("scrolled_back", scrolled_back),
     ("markdown", markdown),
+    ("markdown_typography", markdown_typography),
+    ("markdown_structure", markdown_structure),
     ("latex", latex),
     ("code_block", code_block),
     ("session_strip", session_strip),
     ("session_strip_second_group", session_strip_second_group),
+    ("mem_readout", mem_readout),
     ("overview", overview),
     ("overview_opening", overview_opening),
     ("overview_other_session", overview_other_session),
@@ -47,6 +59,7 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("overview_many_sessions", overview_many_sessions),
     ("notice", notice),
     ("error", error),
+    ("offline", offline),
     ("long_paragraph", long_paragraph),
     // Heavy nodes. Every node above is a small, pretty screen, which is what a
     // capture wants and exactly the wrong thing to profile: a sweep over them
@@ -82,7 +95,13 @@ fn fixed_meta() -> crate::meta::Meta {
 
 fn connecting() -> Model {
     Model {
-        theme: crate::theme::Theme::from_env(),
+        // Pinned light: nodes must be a pure function of the model, and
+        // `from_env` now reads the real system preference, which would make
+        // every capture depend on the machine it ran on.
+        theme: crate::theme::Theme::print_light(),
+        // Pinned for the same reason: a capture must not re-resolve on the
+        // machine's live preference behind the pinned palette.
+        theme_preference: crate::theme::ThemeMode::Light,
         meta: fixed_meta(),
         status: "connecting to ~/.jcode/jcode-api.sock...".into(),
         session_id: None,
@@ -97,6 +116,7 @@ fn connecting() -> Model {
         scroll: 0.0,
         selection: None,
         notice: None,
+        failure: None,
         donut: Some(fixed_donut()),
         spin: fixed_spin(),
         // Captures pin the hint, so the ghost line is a tested state rather
@@ -119,6 +139,39 @@ fn connecting() -> Model {
         smooth: crate::scroll::Smooth::default(),
         // Detached: no session, so no directory to name.
         working_dir: None,
+        // Pinned off: a live RAM figure would make every capture depend on
+        // the machine and moment it ran on.
+        mem: None,
+        // No bars on screen by default, so nothing animates: a node that wants
+        // one sets it (see `background_progress`).
+        progress_clock: None,
+        // Settled: a node renders the window after the boot reveal, so every
+        // existing capture is unchanged by it. The reveal has its own nodes.
+        boot: crate::boot::Boot::default(),
+    }
+}
+
+/// Three frames of the boot reveal: the black opening, the donut half grown,
+/// and the chrome fading in over it. Pinned times, so each phase is a
+/// deterministic capture rather than something only visible at launch.
+fn boot_opening() -> Model {
+    Model {
+        boot: crate::boot::Boot::pinned(0.02),
+        ..attached_empty()
+    }
+}
+
+fn boot_donut() -> Model {
+    Model {
+        boot: crate::boot::Boot::pinned(0.16),
+        ..attached_empty()
+    }
+}
+
+fn boot_chrome() -> Model {
+    Model {
+        boot: crate::boot::Boot::pinned(0.36),
+        ..attached_empty()
     }
 }
 
@@ -158,7 +211,13 @@ fn fixed_caret() -> crate::caret::Caret {
 
 fn attached_empty() -> Model {
     Model {
-        theme: crate::theme::Theme::from_env(),
+        // Pinned light: nodes must be a pure function of the model, and
+        // `from_env` now reads the real system preference, which would make
+        // every capture depend on the machine it ran on.
+        theme: crate::theme::Theme::print_light(),
+        // Pinned for the same reason: a capture must not re-resolve on the
+        // machine's live preference behind the pinned palette.
+        theme_preference: crate::theme::ThemeMode::Light,
         meta: fixed_meta(),
         status: "attached: session_demo_0000".into(),
         session_id: Some("session_demo_0000".into()),
@@ -173,6 +232,7 @@ fn attached_empty() -> Model {
         scroll: 0.0,
         selection: None,
         notice: None,
+        failure: None,
         donut: Some(fixed_donut()),
         spin: fixed_spin(),
         // Captures pin the hint, so the ghost line is a tested state rather
@@ -193,6 +253,15 @@ fn attached_empty() -> Model {
         // Fixed path, so captures do not depend on where the repo is checked
         // out or on whose `$HOME` the capture ran under.
         working_dir: Some("/home/j/jcode".into()),
+        // Pinned off: a live RAM figure would make every capture depend on
+        // the machine and moment it ran on.
+        mem: None,
+        // No bars on screen by default, so nothing animates: a node that wants
+        // one sets it (see `background_progress`).
+        progress_clock: None,
+        // Settled: a node renders the window after the boot reveal, so every
+        // existing capture is unchanged by it. The reveal has its own nodes.
+        boot: crate::boot::Boot::default(),
     }
 }
 
@@ -438,6 +507,19 @@ fn session_strip() -> Model {
     }
 }
 
+/// The chrome row's RAM caption beside the working directory: `ui`/`srv`
+/// figures pinned so the capture is a tested arrangement rather than whatever
+/// the machine was using.
+fn mem_readout() -> Model {
+    Model {
+        mem: Some(crate::mem::Readout {
+            client_bytes: 105 * 1024 * 1024,
+            server_bytes: Some(428 * 1024 * 1024),
+        }),
+        ..session_strip()
+    }
+}
+
 /// Focus in the second group: proves up/down really moves the highlight to
 /// another directory rather than only recolouring within one.
 fn session_strip_second_group() -> Model {
@@ -617,6 +699,35 @@ fn reasoning() -> Model {
     }
 }
 
+/// A long thought that spans paragraphs and is interleaved with a tool call:
+/// the case where the left rule fragments today. Each reasoning message draws
+/// its own rule, so the thought reads as several separate asides instead of
+/// one continuous think.
+fn reasoning_paragraphs() -> Model {
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("why is the reveal a fraction, not a count?"));
+    transcript.push(Message::reasoning(
+        "The cursor counts markdown *source* characters, but the renderer \
+         draws laid-out glyphs. Every `**` and backtick makes those two \
+         numbers differ.\n\nSo a count would run ahead of the visible edge \
+         whenever the reply contains markup, which is most replies.\n\nA \
+         fraction is the only unit both sides agree on.",
+    ));
+    transcript.push(Message::reasoning(
+        "Second thought after a tool call: the fraction also survives \
+         re-layout when the window resizes, which a glyph count would not.",
+    ));
+    transcript.push(Message::assistant(
+        "Because the reveal cursor and the drawn glyphs are counted in \
+         different units, and only a fraction is well defined across both.",
+    ));
+    Model {
+        transcript,
+        ..attached_empty()
+    }
+}
+
 /// The same turn mid-flight: reasoning is arriving and being swept in by the
 /// same reveal as the answer, with the activity line still running.
 fn reasoning_streaming() -> Model {
@@ -663,6 +774,129 @@ fn tool_progress() -> Model {
     }
 }
 
+/// Waiting on a background task, with its bar on the page. This is the state a
+/// spinner cannot express: the agent is blocked on work that *does* know how
+/// far along it is, and a window that only says "still working" throws that
+/// away.
+fn background_progress() -> Model {
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("run the whole workspace test suite"));
+    transcript.set_live_tool("call_1", "wait for the test sweep");
+    transcript.set_progress(
+        "224715dw29",
+        "bash",
+        "62% · Running jcode-desktop2 tests",
+        Some(62.0),
+    );
+    Model {
+        transcript,
+        busy: true,
+        activity: crate::activity::Activity::pinned(
+            2,
+            std::time::Duration::from_secs(94),
+            Some("wait for the test sweep"),
+        ),
+        // Pinned to the render clock's own instant, so the indeterminate bar in
+        // `background_progress_many` draws at phase zero rather than wherever
+        // the wall clock happens to be.
+        progress_clock: None,
+        ..attached_empty()
+    }
+}
+
+/// Several tasks at once, one of them unable to report a percentage. Bars do
+/// not collapse into one line: a turn waiting on three things has to show which
+/// of them is the one that is stuck.
+fn background_progress_many() -> Model {
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("build, test, and deploy the preview"));
+    transcript.set_progress(
+        "build-1",
+        "bash",
+        "88% · Compiling jcode-app-core",
+        Some(88.0),
+    );
+    transcript.set_progress("test-1", "bash", "12/96 crates", Some(12.5));
+    transcript.set_progress("swarm-1", "swarm", "working · waiting on 3 workers", None);
+    transcript.set_live_tool("call_4", "wait for the plan to resolve");
+    Model {
+        transcript,
+        busy: true,
+        activity: crate::activity::Activity::pinned(
+            6,
+            std::time::Duration::from_secs(212),
+            Some("wait for the plan to resolve"),
+        ),
+        ..attached_empty()
+    }
+}
+
+/// A finished edit, kept in the transcript. This is the state the live tool
+/// card cannot express: the call is over, but what it *did* to the user's files
+/// has to stay readable, so the intent, the file, and the changed lines stand as
+/// their own card between the turns.
+fn edit_card() -> Model {
+    use crate::edits::EditCard;
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("make the fade decay instead of snapping"));
+    transcript.push_edit(&EditCard {
+        intent: Some("decay the scrollbar fade instead of clearing it".into()),
+        files: vec!["crates/jcode-desktop2/src/scroll.rs".into()],
+        diff: "118- self.fade = 0.0;\n118+ self.fade = (self.fade - dt / FADE_SECONDS).max(0.0);\n"
+            .into(),
+        added: 1,
+        removed: 1,
+    });
+    transcript.push(Message::assistant(
+        "The bar now eases out over `FADE_SECONDS` rather than disappearing on \
+         the frame the wheel stops.",
+    ));
+    Model {
+        transcript,
+        ..attached_empty()
+    }
+}
+
+/// Several edits in one turn, with the next call still running. The cards
+/// accumulate (each is a change that happened) while the live tool card stays
+/// pinned to the tail: the two must not fight over the bottom of the page.
+fn edit_cards_many() -> Model {
+    use crate::edits::EditCard;
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("rename `alpha` to `fade` everywhere"));
+    for (file, line) in [
+        ("crates/jcode-desktop2/src/scroll.rs", 118usize),
+        ("crates/jcode-desktop2/src/scene.rs", 402),
+        ("crates/jcode-desktop2/src/layout.rs", 77),
+    ] {
+        transcript.push_edit(&EditCard {
+            intent: Some(format!(
+                "rename the field in {}",
+                file.rsplit('/').next().unwrap()
+            )),
+            files: vec![file.into()],
+            diff: format!("{line}- let alpha = self.alpha;\n{line}+ let fade = self.fade;\n"),
+            added: 1,
+            removed: 1,
+        });
+    }
+    transcript.set_live_tool("call_9", "run the desktop2 tests");
+    Model {
+        transcript,
+        busy: true,
+        activity: crate::activity::Activity::pinned(
+            4,
+            std::time::Duration::from_secs(31),
+            Some("run the desktop2 tests"),
+        ),
+        ..attached_empty()
+    }
+}
+
 fn streaming() -> Model {
     Model {
         transcript: conversation(vec![(
@@ -694,6 +928,31 @@ fn working() -> Model {
             5,
             std::time::Duration::from_secs(42),
             Some("running the desktop2 test suite"),
+        ),
+        ..attached_empty()
+    }
+}
+
+/// A message typed while the agent was mid-turn: it waits at the tail in the
+/// queued tone, under the reply that is still streaming in. This is the state
+/// that replaced the daemon's "already processing" error.
+fn queued_message() -> Model {
+    let mut transcript = conversation(vec![(
+        "explain the harness API handshake".into(),
+        "The client opens the socket and sends a `hello` frame carrying \
+         its supported version range. The server replies with"
+            .into(),
+    )]);
+    transcript.push(crate::transcript::Message::queued(
+        "and after that, add a reconnect test",
+    ));
+    Model {
+        transcript,
+        busy: true,
+        activity: crate::activity::Activity::pinned(
+            2,
+            std::time::Duration::from_secs(8),
+            Some("thinking"),
         ),
         ..attached_empty()
     }
@@ -755,6 +1014,85 @@ fn markdown() -> Model {
     }
 }
 
+/// Every inline and block treatment at once, so one capture answers "does
+/// markdown read well" rather than needing a state per feature.
+///
+/// This is the state the typography work is judged against: inline code has to
+/// be visibly literal, a link visibly a link, a list visibly one list, a
+/// heading visibly attached to the text under it, and a rule visibly a rule
+/// rather than three dashes.
+fn markdown_typography() -> Model {
+    Model {
+        transcript: conversation(vec![(
+            "walk me through the renderer".into(),
+            // Written as one block with explicit newlines rather than with Rust
+            // line continuations, because a continuation eats the leading
+            // whitespace and a nested list item would silently flatten.
+            concat!(
+                "# Renderer\n\n",
+                "Markdown comes from `jcode-render-core`, so the desktop and the TUI ",
+                "agree on what a document *is*. See ",
+                "[the notes](https://example.com/notes) for the shape of it.\n\n",
+                "## Blocks\n\n",
+                "A block is laid out once and reused while it is unchanged:\n\n",
+                "- a paragraph wraps to the measure\n",
+                "- a `CodeBlock { language }` sits on its own wash\n",
+                "  - nested items step in\n",
+                "  - and stay one list\n",
+                "- a `Table` is columnised by the front-end, and ~~never~~ by the core\n\n",
+                "Then, in order:\n\n",
+                "1. parse into blocks\n",
+                "2. flatten each into spans\n",
+                "3. hand the spans to **Parley**\n\n",
+                "> Geometry is measured, never estimated.\n\n",
+                "---\n\n",
+                "### Cost\n\n",
+                "Laying out $n$ blocks costs $O(n)$, and a delta re-lays only the ",
+                "tail, so the total is\n\n",
+                "$$\\sum_{i=1}^{n} c_i \\leq n \\cdot \\max_i c_i$$\n\n",
+                "which is why streaming stays flat. Use `--stream-bench` to check it.\n",
+            )
+            .into(),
+        )]),
+        ..attached_empty()
+    }
+}
+
+/// The structural end of markdown: a wide aligned table, a task list, and a
+/// list with a fenced block and a quote written *inside* its items.
+///
+/// These are the cases that read as broken rather than merely plain when the
+/// front-end ignores them: a table that runs off the measure loses its right
+/// columns, `[x]` renders as source next to a rendered bullet, and a fenced
+/// block indented back to the margin breaks its list open.
+fn markdown_structure() -> Model {
+    Model {
+        transcript: conversation(vec![(
+            "what changed in the wire format".into(),
+            concat!(
+                "| field | meaning | bytes |\n",
+                "|:--|:-:|--:|\n",
+                "| `kind` | which frame this is, and how to read the rest of it | 1 |\n",
+                "| `session` | the session the frame belongs to | 16 |\n",
+                "| `payload` | length-prefixed body, encoded as line-delimited JSON | 4096 |\n\n",
+                "Migration:\n\n",
+                "- [x] carry the alignments through the model\n",
+                "- [x] budget the columns against the measure\n",
+                "- [ ] version the header\n\n",
+                "1. read the header\n\n",
+                "   ```rust\n",
+                "   let kind = Kind::from_u8(bytes[0])?;\n",
+                "   ```\n\n",
+                "   then dispatch on it.\n\n",
+                "2. read the payload\n\n",
+                "   > A short frame is a protocol error, never a partial read.\n",
+            )
+            .into(),
+        )]),
+        ..attached_empty()
+    }
+}
+
 /// Inline and display math. The transcript must render these as math, not
 /// print the LaTeX source at the user.
 fn latex() -> Model {
@@ -763,6 +1101,10 @@ fn latex() -> Model {
             "what is the cost".into(),
             "The march is $O(n^2)$ per frame, with $n$ the grid side.\n\n\
              $$\\frac{a + b}{c}$$\n\n\
+             The total work is a sum over rays:\n\n\
+             $$\\sum_{i=1}^{n} \\sqrt{x_i^2 + y_i^2} \\leq \\alpha \\cdot \\pi n$$\n\n\
+             with the rotation applied as\n\n\
+             $$\\begin{pmatrix} \\cos\\theta & -\\sin\\theta \\\\ \\sin\\theta & \\cos\\theta \\end{pmatrix}$$\n\n\
              So halving $n$ quarters the work."
                 .into(),
         )]),
@@ -788,6 +1130,28 @@ fn error() -> Model {
     Model {
         status: "disconnected: daemon connection closed".into(),
         ..turn_done()
+    }
+}
+
+/// The failure this whole path exists for: the machine is offline, so the turn
+/// the user asked for could not run. The report has to be *in the
+/// conversation*, because the status line is suppressed for an attached
+/// session and a failure nobody can see reads as an app that ignored them.
+fn offline() -> Model {
+    let mut transcript = conversation(vec![(
+        "explain the harness API handshake".into(),
+        String::new(),
+    )]);
+    transcript.push_notice(
+        "no network connection: error sending request for \
+         url (https://api.anthropic.com/v1/messages): dns error",
+    );
+    Model {
+        transcript,
+        busy: false,
+        status: "no network connection".into(),
+        failure: Some("no network connection".into()),
+        ..attached_empty()
     }
 }
 

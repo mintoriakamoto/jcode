@@ -169,8 +169,8 @@ async fn first_party_tool_definitions_require_intent_with_display_only_docs() {
             schema["properties"]["intent"]["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("display only"),
-            "{} intent description should say it is display-only",
+                .contains("shown in the UI"),
+            "{} intent description should say it is UI-display-only",
             def.name
         );
         let required = schema["required"].as_array().cloned().unwrap_or_default();
@@ -442,6 +442,97 @@ async fn print_tool_definition_token_report() {
     }
 }
 
+/// Tool descriptions are always-on prompt cost, so they are capped at ~20
+/// estimated tokens. Behavioral guidance belongs in parameter descriptions.
+/// Exemptions must be justified inline.
+#[tokio::test]
+async fn tool_descriptions_stay_under_token_cap() {
+    const DESCRIPTION_TOKEN_CAP: usize = 20;
+    // discover_tools keeps a deliberate second sentence disclosing that catalog
+    // entries are vetted/partnered integrations.
+    // swarm appends the user-tunable swarm-prompt.md by design.
+    const EXEMPT: &[&str] = &["discover_tools", "swarm"];
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let over_cap: Vec<String> = registry
+        .definitions(None)
+        .await
+        .into_iter()
+        .filter(|def| !EXEMPT.contains(&def.name.as_str()))
+        .filter(|def| def.description_token_estimate() > DESCRIPTION_TOKEN_CAP)
+        .map(|def| {
+            format!(
+                "{} (~{} tokens): {}",
+                def.name,
+                def.description_token_estimate(),
+                def.description
+            )
+        })
+        .collect();
+    assert!(
+        over_cap.is_empty(),
+        "tool descriptions over the {DESCRIPTION_TOKEN_CAP}-token cap:\n{}",
+        over_cap.join("\n")
+    );
+}
+
+fn collect_param_descriptions(schema: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match schema {
+        Value::Object(map) => {
+            if path != "$"
+                && let Some(Value::String(description)) = map.get("description")
+            {
+                out.push((path.to_string(), description.clone()));
+            }
+            for (key, value) in map {
+                if key == "description" {
+                    continue;
+                }
+                collect_param_descriptions(value, &format!("{path}.{key}"), out);
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                collect_param_descriptions(item, &format!("{path}[{idx}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parameter descriptions inside tool schemas are also always-on prompt cost,
+/// so each is capped. Longer guidance belongs in runtime error messages, docs,
+/// or the system prompt (the todo calibration rubrics, for example, live in
+/// the gate continuation messages in jcode-base::todo).
+#[tokio::test]
+async fn tool_parameter_descriptions_stay_under_token_cap() {
+    const PARAM_DESCRIPTION_TOKEN_CAP: usize = 25;
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let mut over_cap: Vec<String> = Vec::new();
+    for def in registry.definitions(None).await {
+        let mut descriptions = Vec::new();
+        collect_param_descriptions(&def.input_schema, "$", &mut descriptions);
+        for (path, description) in descriptions {
+            let tokens = crate::util::estimate_tokens(&description);
+            if tokens > PARAM_DESCRIPTION_TOKEN_CAP {
+                over_cap.push(format!(
+                    "{} {} (~{} tokens): {}",
+                    def.name, path, tokens, description
+                ));
+            }
+        }
+    }
+    assert!(
+        over_cap.is_empty(),
+        "{} parameter descriptions over the {PARAM_DESCRIPTION_TOKEN_CAP}-token cap:\n{}",
+        over_cap.len(),
+        over_cap.join("\n")
+    );
+}
+
 fn schema_type_includes(schema: &Value, expected: &str) -> bool {
     match schema.get("type") {
         Some(Value::String(value)) => value == expected,
@@ -457,6 +548,27 @@ fn collect_schema_errors(schema: &Value, path: &str, errors: &mut Vec<String>) {
         Value::Object(map) => {
             if schema_type_includes(schema, "array") && !map.contains_key("items") {
                 errors.push(format!("{path}: array schema missing items"));
+            }
+
+            // Gemini validates `required` against the same object's `properties`
+            // and rejects the entire request when a name is missing, which broke
+            // every tool-enabled Gemini call (issue #655). Objects without a
+            // local `properties` map are exempt: there is nothing to check
+            // against, and Gemini accepts those.
+            if let (Some(Value::Array(required)), Some(Value::Object(properties))) =
+                (map.get("required"), map.get("properties"))
+            {
+                for name in required {
+                    let Some(name) = name.as_str() else {
+                        errors.push(format!("{path}.required: entries must be strings"));
+                        continue;
+                    };
+                    if !properties.contains_key(name) {
+                        errors.push(format!(
+                            "{path}.required: '{name}' is not defined in the same object's properties"
+                        ));
+                    }
+                }
             }
 
             for keyword in ["anyOf", "oneOf", "allOf"] {
@@ -715,4 +827,54 @@ async fn gemini_build_tools_from_registry_definitions_omits_const_keywords() {
         &serde_json::json!(parameters),
         "const"
     ));
+
+    // Gemini rejects the whole generateContent request when any `required` entry
+    // names a property the same object does not declare, which made every
+    // tool-enabled Gemini call fail (issue #655). Assert on the *converted*
+    // declarations: the pre-conversion sweep in
+    // `test_tool_definitions_do_not_expose_invalid_array_schemas` cannot prove
+    // the adapter output is clean, and the adapter is what Gemini actually sees.
+    let mut dangling = Vec::new();
+    for declaration in parameters {
+        collect_dangling_required(
+            &declaration.parameters,
+            &format!("tool `{}`", declaration.name),
+            &mut dangling,
+        );
+    }
+    assert!(
+        dangling.is_empty(),
+        "converted Gemini function declarations still require undeclared properties:\n{}",
+        dangling.join("\n")
+    );
+}
+
+/// Collect `required` entries that name a property absent from the same
+/// object's `properties` map. Objects without a local `properties` map are
+/// exempt, matching what Gemini validates.
+fn collect_dangling_required(schema: &Value, path: &str, errors: &mut Vec<String>) {
+    match schema {
+        Value::Object(map) => {
+            if let (Some(Value::Array(required)), Some(Value::Object(properties))) =
+                (map.get("required"), map.get("properties"))
+            {
+                for name in required {
+                    if let Some(name) = name.as_str()
+                        && !properties.contains_key(name)
+                    {
+                        errors.push(format!("{path}.required: '{name}' is not declared here"));
+                    }
+                }
+            }
+            for (key, value) in map {
+                collect_dangling_required(value, &format!("{path}.{key}"), errors);
+            }
+        }
+        Value::Array(values) => {
+            for (idx, value) in values.iter().enumerate() {
+                collect_dangling_required(value, &format!("{path}[{idx}]"), errors);
+            }
+        }
+        _ => {}
+    }
 }
