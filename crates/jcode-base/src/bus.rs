@@ -314,24 +314,6 @@ pub struct ProductivityReportPayload {
     pub png_path: std::path::PathBuf,
 }
 
-/// Result of a `/tokensaverstats` or `/cooklabs` rtk invocation.
-///
-/// Carries already-formatted text so the TUI layer can display it without
-/// re-running the rtk CLI on the UI thread.
-#[derive(Clone, Debug)]
-pub struct CookLabsCommandCompleted {
-    pub session_id: String,
-    pub result: std::result::Result<CookLabsCommandPayload, String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct CookLabsCommandPayload {
-    /// Formatted transcript block, ready to display as a system message.
-    pub message: String,
-    /// Short status-line notice.
-    pub notice: String,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SidePanelUpdated {
     pub session_id: String,
@@ -468,8 +450,6 @@ pub enum BusEvent {
     MermaidRenderCompleted,
     /// Productivity report finished generating off the UI thread
     ProductivityReportReady(ProductivityReportReady),
-    /// `/tokensaverstats` or `/cooklabs` rtk invocation finished off the UI thread
-    CookLabsCommandCompleted(CookLabsCommandCompleted),
 }
 
 pub struct Bus {

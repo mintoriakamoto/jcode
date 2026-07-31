@@ -32,8 +32,6 @@ pub(super) fn dispatch_local_command(app: &mut App, trimmed: &str) -> bool {
         || super::model_context::handle_model_command(app, trimmed)
         || super::commands::handle_usage_command(app, trimmed)
         || super::productivity::handle_productivity_command(app, trimmed)
-        || super::cooklabs::handle_tokensaverstats_command(app, trimmed)
-        || super::cooklabs::handle_cooklabs_command(app, trimmed)
         || super::commands::handle_feedback_command(app, trimmed)
         || super::commands::handle_telemetry_command(app, trimmed)
         || super::support::handle_support_command(app, trimmed)

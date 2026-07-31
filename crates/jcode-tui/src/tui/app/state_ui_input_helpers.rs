@@ -146,14 +146,6 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "Generate a shareable usage report + dashboard image",
     ),
     RegisteredCommand::public("/wrapped", "Alias for /productivity"),
-    RegisteredCommand::public(
-        "/tokensaverstats",
-        "Show Cook Labs (rtk) token savings for this machine",
-    ),
-    RegisteredCommand::public(
-        "/cooklabs",
-        "Activate Cook Labs savings sync with a portal key",
-    ),
     RegisteredCommand::public("/feedback", "Send feedback about jcode"),
     RegisteredCommand::public("/telemetry", "Show or change what jcode sends"),
     RegisteredCommand::public("/support", "Email support with diagnostics prefilled"),

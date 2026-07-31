@@ -701,7 +701,6 @@ impl App {
             usage_overlay: None,
             usage_report_refreshing: false,
             productivity_refreshing: false,
-            cooklabs_command_running: false,
             last_overnight_card_refresh: None,
             workspace_client: crate::tui::workspace_client::WorkspaceClientState::default(),
         };
@@ -1133,7 +1132,6 @@ impl App {
             usage_overlay: None,
             usage_report_refreshing: false,
             productivity_refreshing: false,
-            cooklabs_command_running: false,
             last_overnight_card_refresh: None,
             workspace_client: crate::tui::workspace_client::WorkspaceClientState::default(),
         };

@@ -60,7 +60,6 @@ mod commands_plan;
 mod commands_remote;
 mod commands_review;
 mod conversation_state;
-mod cooklabs;
 mod copy_selection;
 mod debug;
 mod dictation;
@@ -1587,8 +1586,6 @@ pub struct App {
     usage_report_refreshing: bool,
     /// Whether a `/productivity` report generation is currently in flight.
     productivity_refreshing: bool,
-    /// Whether a `/tokensaverstats` or `/cooklabs` rtk invocation is in flight.
-    cooklabs_command_running: bool,
     /// Last time the passive overnight progress card polled its run files.
     last_overnight_card_refresh: Option<Instant>,
     /// Per-client Niri-style workspace navigation state. Previously a process
