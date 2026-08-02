@@ -113,10 +113,26 @@ pub enum Action {
     /// Close the field without switching.
     OverviewCancel,
 
+    /// Ctrl+Shift+D: flip the window between light and dark without opening
+    /// anything. The panel is where a setting is *found*; a palette is the one
+    /// setting people change often enough to want it on a key.
+    ToggleTheme,
+
+    /// Ctrl+comma: open or shut the settings panel. The chord every desktop
+    /// app puts preferences on, so it needs no discovering.
+    ToggleSettings,
+
     /// Ctrl+Shift+R: cycle how much of the model's thinking the transcript
     /// keeps (`current` -> `full` -> `off`). A view choice, so it is a
     /// keypress rather than a config edit and a restart.
     CycleReasoningDisplay,
+
+    /// Ctrl+plus / Ctrl+minus / Ctrl+0: grow, shrink, or reset the UI zoom.
+    /// The browser's chords, because "the text is too small" is a browser-
+    /// shaped problem and everyone already has the muscle memory.
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 impl Action {
@@ -357,6 +373,16 @@ pub const PORTED: &[Ported] = &[
         tui: "web: select all (alias)",
     },
     Ported {
+        chord: "ctrl+shift+d",
+        action: Action::ToggleTheme,
+        tui: "light/dark theme",
+    },
+    Ported {
+        chord: "ctrl+,",
+        action: Action::ToggleSettings,
+        tui: "settings panel",
+    },
+    Ported {
         chord: "ctrl+shift+z",
         action: Action::Redo,
         tui: "web: redo",
@@ -514,6 +540,21 @@ pub const PORTED: &[Ported] = &[
         chord: "ctrl+alt+down",
         action: Action::SessionDown,
         tui: "no TUI equivalent: desktop-only session strip",
+    },
+    Ported {
+        chord: "ctrl+=",
+        action: Action::ZoomIn,
+        tui: "no TUI equivalent: the terminal owns font size there",
+    },
+    Ported {
+        chord: "ctrl+-",
+        action: Action::ZoomOut,
+        tui: "no TUI equivalent: the terminal owns font size there",
+    },
+    Ported {
+        chord: "ctrl+0",
+        action: Action::ZoomReset,
+        tui: "no TUI equivalent: the terminal owns font size there",
     },
 ];
 
@@ -680,6 +721,23 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
         },
         Key::Character(text) => {
             let ch = text.chars().next().map(|c| c.to_ascii_lowercase())?;
+            // Zoom first: the chord is Ctrl plus a punctuation key whose glyph
+            // depends on the layout and on whether Shift is held (`+` vs `=`,
+            // `_` vs `-`), so every spelling is accepted rather than only the
+            // unshifted one. Checked before the shifted and Alt blocks so
+            // Ctrl+Shift+= cannot be swallowed on the way past.
+            if cmd && !alt {
+                match ch {
+                    // Preferences, on the chord the whole desktop uses. Both
+                    // spellings, because a shifted comma is `<` on most
+                    // layouts and the user's finger does not know that.
+                    ',' | '<' => return Some(Action::ToggleSettings),
+                    '+' | '=' => return Some(Action::ZoomIn),
+                    '-' | '_' => return Some(Action::ZoomOut),
+                    '0' => return Some(Action::ZoomReset),
+                    _ => {}
+                }
+            }
             if (ctrl || sup || alt) && shift {
                 match ch {
                     // Ctrl+Shift+Z is redo everywhere on the web.
@@ -690,6 +748,9 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
                     'j' => return Some(Action::ScrollDown),
                     'c' => return Some(Action::Copy),
                     'a' => return Some(Action::SelectAll),
+                    // Ctrl+Shift+D: light/dark. Shifted so it cannot collide
+                    // with a plain Ctrl+D, which is interrupt-or-quit.
+                    'd' => return Some(Action::ToggleTheme),
                     // Ctrl+Shift+R: how much thinking is shown. Shifted so it
                     // cannot collide with a future plain Ctrl+R (recovery in
                     // the TUI), and grouped with the other view chords.

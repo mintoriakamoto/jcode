@@ -532,6 +532,12 @@ async fn handle_remote_key_internal(
                 app.paste_from_clipboard();
                 return Ok(());
             }
+            // Cmd+L mirrors Ctrl+L: terminal-style clear (blank spacer
+            // pushes the transcript up into scrollback).
+            KeyCode::Char('l') => {
+                app.clear_view_terminal_style();
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -615,6 +621,9 @@ async fn handle_remote_key_internal(
                 }
                 return Ok(());
             }
+            KeyCode::Char('d') if input::try_ctrl_d_forward_delete(app) => {
+                return Ok(());
+            }
             KeyCode::Char('c') | KeyCode::Char('d') => {
                 if app.is_processing {
                     remote.cancel_with_reason("keyboard_ctrl_c_or_d").await?;
@@ -629,9 +638,12 @@ async fn handle_remote_key_internal(
                 return Ok(());
             }
             KeyCode::Char('l') => {
-                // Terminal-style view clear (context kept); the diagram/diff
-                // focus handler above wins while a side pane is available.
-                app.clear_view_keep_context();
+                // Terminal-style clear: a viewport-height blank spacer pushes
+                // the transcript up into scrollback, leaving a clean prompt.
+                // Nothing is deleted; /cls does the actual view wipe. The
+                // diagram/diff focus handler above wins while a pane is
+                // available.
+                app.clear_view_terminal_style();
                 return Ok(());
             }
             KeyCode::Char('u') => {

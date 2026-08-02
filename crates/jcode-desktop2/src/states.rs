@@ -38,7 +38,9 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("background_progress_many", background_progress_many),
     ("edit_card", edit_card),
     ("edit_cards_many", edit_cards_many),
+    ("edit_card_large", edit_card_large),
     ("working", working),
+    ("message_sent", message_sent),
     ("queued_message", queued_message),
     ("turn_done", turn_done),
     ("transcript_selection", transcript_selection),
@@ -57,6 +59,8 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("overview_preview", overview_preview),
     ("overview_single_session", overview_single_session),
     ("overview_many_sessions", overview_many_sessions),
+    ("settings_panel", settings_panel),
+    ("settings_panel_hover", settings_panel_hover),
     ("notice", notice),
     ("error", error),
     ("offline", offline),
@@ -148,6 +152,15 @@ fn connecting() -> Model {
         // Settled: a node renders the window after the boot reveal, so every
         // existing capture is unchanged by it. The reveal has its own nodes.
         boot: crate::boot::Boot::default(),
+        // Pinned, not loaded: a capture must not depend on the developer's own
+        // saved preferences. The panel is shut, so every existing node is
+        // pixel-identical; `settings_panel` is the node that opens it.
+        settings: crate::settings::Settings {
+            theme: crate::theme::ThemeMode::Light,
+            reasoning: crate::reasoning::ReasoningMode::Current,
+            motion: true,
+        },
+        panel: crate::settings::Panel::default(),
     }
 }
 
@@ -262,6 +275,15 @@ fn attached_empty() -> Model {
         // Settled: a node renders the window after the boot reveal, so every
         // existing capture is unchanged by it. The reveal has its own nodes.
         boot: crate::boot::Boot::default(),
+        // Pinned, not loaded: a capture must not depend on the developer's own
+        // saved preferences. The panel is shut, so every existing node is
+        // pixel-identical; `settings_panel` is the node that opens it.
+        settings: crate::settings::Settings {
+            theme: crate::theme::ThemeMode::Light,
+            reasoning: crate::reasoning::ReasoningMode::Current,
+            motion: true,
+        },
+        panel: crate::settings::Panel::default(),
     }
 }
 
@@ -669,6 +691,34 @@ fn overview_preview() -> Model {
     }
 }
 
+/// The settings panel, open on an empty session: the state a user lands in
+/// the moment they click the gear.
+fn settings_panel() -> Model {
+    let mut panel = crate::settings::Panel::default();
+    panel.open();
+    Model {
+        panel,
+        ..attached_empty()
+    }
+}
+
+/// The same panel with a row highlighted, so the hover band is a capture
+/// rather than something only visible with a mouse in hand.
+fn settings_panel_hover() -> Model {
+    let mut panel = crate::settings::Panel::default();
+    panel.open();
+    panel.set_hover(Some(1));
+    Model {
+        panel,
+        settings: crate::settings::Settings {
+            theme: crate::theme::ThemeMode::Light,
+            reasoning: crate::reasoning::ReasoningMode::Full,
+            motion: false,
+        },
+        ..attached_empty()
+    }
+}
+
 fn notice() -> Model {
     Model {
         editor: editor_with("undo me", None),
@@ -897,6 +947,33 @@ fn edit_cards_many() -> Model {
     }
 }
 
+/// A rewrite big enough that the card cannot show all of it, over a file whose
+/// language is not one the highlighter knows. Both are the cases where a diff
+/// card most easily goes wrong: it either swallows the page or renders as a
+/// wall of one colour.
+fn edit_card_large() -> Model {
+    use crate::edits::EditCard;
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("port the config loader to the new schema"));
+    let mut diff = String::new();
+    for line in 1..=60usize {
+        diff.push_str(&format!("{line}- old_key_{line} = \"value {line}\"\n"));
+        diff.push_str(&format!("{line}+ new.key.{line} = \"value {line}\"\n"));
+    }
+    transcript.push_edit(&EditCard {
+        intent: Some("move every key under the new namespace".into()),
+        files: vec!["config/defaults.toml".into()],
+        diff,
+        added: 60,
+        removed: 60,
+    });
+    Model {
+        transcript,
+        ..attached_empty()
+    }
+}
+
 fn streaming() -> Model {
     Model {
         transcript: conversation(vec![(
@@ -929,6 +1006,24 @@ fn working() -> Model {
             std::time::Duration::from_secs(42),
             Some("running the desktop2 test suite"),
         ),
+        ..attached_empty()
+    }
+}
+
+/// The first frame after Enter: the message is on the page and out the socket,
+/// but nothing has confirmed it landed. This is the longest-lived state of the
+/// send lifecycle on a slow link, and the one where the user is most likely to
+/// be staring at their own words, so it gets a node of its own: the tone here
+/// is what made a prompt unreadable in dark mode.
+fn message_sent() -> Model {
+    let mut transcript = crate::transcript::Transcript::default();
+    transcript.push(crate::transcript::Message::sent(
+        "explain the harness API handshake",
+    ));
+    Model {
+        transcript,
+        busy: true,
+        activity: crate::activity::Activity::pinned(0, std::time::Duration::ZERO, None),
         ..attached_empty()
     }
 }
@@ -1086,6 +1181,8 @@ fn markdown_structure() -> Model {
                 "   then dispatch on it.\n\n",
                 "2. read the payload\n\n",
                 "   > A short frame is a protocol error, never a partial read.\n",
+                "   >\n",
+                "   > > and a long one is a bug in the sender.\n",
             )
             .into(),
         )]),
