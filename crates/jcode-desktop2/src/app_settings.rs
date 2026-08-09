@@ -6,7 +6,7 @@
 //! testing without a GPU.
 
 use crate::App;
-use crate::settings::{ROWS, Row};
+use crate::settings::Row;
 
 impl App {
     /// A press somewhere on the page, while the settings UI might want it.
@@ -19,6 +19,10 @@ impl App {
             self.request_redraw();
             return true;
         }
+        if !self.model.panel.is_open() && self.frame.hits_sessions(x, y) {
+            self.open_overview();
+            return true;
+        }
         if !self.model.panel.is_open() {
             return false;
         }
@@ -26,7 +30,7 @@ impl App {
         // row applies it and a click anywhere else dismisses without also
         // doing whatever was under the pointer. Dismiss-and-act would mean a
         // click aimed at closing the menu could land in the composer.
-        match self.frame.panel_row_at(ROWS.len(), x, y) {
+        match self.frame.panel_row_at(self.model.panel.rows().len(), x, y) {
             Some(index) => self.cycle_setting(index),
             None => self.model.panel.close(),
         }
@@ -40,7 +44,7 @@ impl App {
         if !self.model.panel.is_open() {
             return false;
         }
-        let row = self.frame.panel_row_at(ROWS.len(), x, y);
+        let row = self.frame.panel_row_at(self.model.panel.rows().len(), x, y);
         self.model.panel.set_hover(row)
     }
 
@@ -50,9 +54,20 @@ impl App {
     /// is visible in the window itself, so the change *is* the feedback, and a
     /// confirmation step would only delay it.
     pub(crate) fn cycle_setting(&mut self, index: usize) {
-        let Some(row) = ROWS.get(index).copied() else {
+        let Some(row) = self.model.panel.rows().get(index).copied() else {
             return;
         };
+        // The one row that is a door rather than a dial: it acts and shuts the
+        // menu, because leaving it open over a newly-focused editor window
+        // would be stale chrome.
+        if row == Row::More {
+            self.model.panel.show_config();
+            return;
+        }
+        if row == Row::Back {
+            self.model.panel.show_general();
+            return;
+        }
         // The desktop's own preference is part of the answer for the theme
         // row, so it is read once here and handed down rather than consulted
         // twice with a chance of disagreeing between the step and the resolve.
@@ -87,6 +102,8 @@ impl App {
                     .motion
                     .then(|| crate::donut::Donut::new(crate::DONUT_GRID));
             }
+            Row::CopyOnSelect => {}
+            Row::More | Row::Back => {}
         }
     }
 

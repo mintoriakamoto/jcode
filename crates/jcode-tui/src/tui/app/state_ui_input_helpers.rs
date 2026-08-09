@@ -76,6 +76,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "/fast-release",
         "Publish Linux immediately from the warm selfdev cache; CI adds other platforms",
     ),
+    RegisteredCommand::public(
+        "/fast-macos-release",
+        "Publish a prepared macOS arm64 build immediately; CI adds other platforms",
+    ),
     RegisteredCommand::public("/remote", "Reach this session from another machine"),
     RegisteredCommand::public(
         "/remote-release",
@@ -1378,6 +1382,9 @@ impl App {
                         choosing: review.choosing,
                         summary_pill: match review.summary_pill {
                             SummaryPill::Continue => crate::tui::ImportSummaryPill::Continue,
+                            SummaryPill::Subscription => {
+                                crate::tui::ImportSummaryPill::Subscription
+                            }
                             SummaryPill::ImportLess => crate::tui::ImportSummaryPill::ImportLess,
                             SummaryPill::Telemetry => crate::tui::ImportSummaryPill::Telemetry,
                         },

@@ -70,6 +70,9 @@ impl App {
             "fast-release" | "cut-release" | "commit-push-release" => {
                 "/fast-release\nSame as /commit-push, then publish the release as quickly as possible from the local Linux machine.\n\nThe agent picks the semver bump and first runs scripts/quick-release.sh --prepare-fast before changing Cargo.toml. This refreshes and records the warm target/selfdev Linux binary without invalidating the cache for a version change. The agent then makes one release-metadata commit containing Cargo.toml, Cargo.lock, and the changelog, pushes it, and runs scripts/quick-release.sh --fast-local. That command wraps the prepared binary with the release identity, publishes Linux and the GitHub release immediately, and lets CI replace it with the portable Linux build while adding every other platform and final signoff assets. /cut-release is a compatibility alias."
             }
+            "fast-macos-release" => {
+                "/fast-macos-release\nSame as /commit-push, but prepare and publish macOS arm64 as quickly as possible from the local Linux machine.\n\nThe agent first runs scripts/quick-release.sh --prepare-fast-macos before changing Cargo.toml. This cross-builds macOS arm64 with the future release identity and records its source commit and checksum. After the release-metadata commit, scripts/quick-release.sh --fast-macos-local validates and publishes that asset immediately. CI then replaces it with the signoff build and adds macOS Intel and every other platform. Requires osxcross."
+            }
             "remote-release" => {
                 "/remote-release\nSame as /commit-push, then push the release tag without running any local build.\n\nThe agent picks the semver bump, updates Cargo.toml/Cargo.lock and the changelog, commits and pushes, then runs scripts/quick-release.sh --remote. GitHub Actions builds, signs, checksums, and publishes every platform; the release remains a draft until the remote gates pass."
             }
@@ -166,10 +169,10 @@ impl App {
                 "/usage\nFetch and display usage limits for connected providers. This command only reports real connected-provider usage windows and reset times."
             }
             "subscription" => {
-                "/subscription\nShow curated jcode subscription status for this session, including router config, runtime mode, curated models, and planned tier budget scaffolding."
+                "/subscription\nCompatibility alias for /hosted status. Shows hosted-model usage, your monthly spending limit, billing status, and router configuration."
             }
-            "subscribe" => {
-                "/subscribe\nWhy subscribe to jcode: more tokens on curated frontier models, one browser sign-in with no API keys, failover routing, and funding open-source development. Lists plans and prices, then start with /login jcode."
+            "subscribe" | "hosted" => {
+                "/hosted\nUse Jcode hosted models without a subscription: choose a monthly spending limit, receive milestone warnings without throttling, and pay in progressively larger tranches. Sign in once with /login jcode.\n\n/hosted status\nShow usage and your current spending limit.\n\n/subscribe\nCompatibility alias for /hosted."
             }
             "version" => "/version\nShow jcode version/build details.",
             "changelog" => "/changelog\nShow recent changes embedded in this build.",
@@ -190,7 +193,7 @@ impl App {
                 "/tool-call-details\nShow whether the dimmed technical detail (command, path, args) renders next to the model-provided intent on tool rows.\n\n/tool-call-details on\nShow the technical detail after the intent, e.g. `bash · Run tests · $ cargo test`.\n\n/tool-call-details off\nShow only the intent on tool rows that have one. Rows without an intent still show the technical detail, and error summaries always render."
             }
             "auth" | "login" => {
-                "/auth\nShow authentication status for all providers.\n\n/login\nInteractive provider selection - pick a provider to log into.\n\n/login <provider>\nStart login flow directly for any provider shown by /login or the /login completions.\n\nUse /login jcode for curated jcode subscription access via your router, not OpenRouter BYOK."
+                "/auth\nShow authentication status for all providers.\n\n/login\nInteractive provider selection - pick a provider to log into.\n\n/login <provider>\nStart login flow directly for any provider shown by /login or the /login completions.\n\nUse /login jcode for pay-as-you-go hosted models through the Jcode router. Set a monthly spending limit in the browser; no API key is pasted into the terminal."
             }
             "account" | "accounts" => {
                 "/account\nOpen the inline account picker showing both Claude and OpenAI accounts together. It lists saved accounts plus new/replace actions for each provider.\n\n/account claude  or  /account openai\nOpen the inline picker filtered to that provider.\n\n/account <provider> settings\nShow provider-specific account/settings details.\n\n/account <provider> login\nStart or refresh credentials for a provider.\n\n/account claude add  or  /account openai add\nCreate the next numbered OAuth account directly.\n\n/account <provider> switch <label>\nSwitch the active account for multi-account providers.\n\n/account <provider> remove <label>\nRemove a saved account.\n\n/account default-provider <provider|auto>\nSet the preferred default provider for future sessions.\n\n/account default-model <model|clear>\nSet the preferred default model for future sessions.\n\nOpenAI-specific settings:\n  /account openai transport ...\n  /account openai effort ...\n  /account openai fast on|off\n\nCustom provider settings:\n  /account openai-compatible api-base ...\n  /account openai-compatible api-key-name ...\n  /account openai-compatible env-file ...\n  /account openai-compatible default-model ..."

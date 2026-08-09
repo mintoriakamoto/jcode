@@ -2528,8 +2528,6 @@ fn run_command_auto_poke_limit_reached(turns_completed: usize, max_turns: Option
         .unwrap_or(false)
 }
 
-const RUN_TODO_CONFIDENCE_THRESHOLD: u8 = 90;
-
 #[derive(Debug)]
 enum RunAutoPokeFollowUp {
     Incomplete {
@@ -2643,10 +2641,9 @@ fn build_run_todo_validation_message(
         return None;
     }
 
-    let completion_confidence_needs_validation = completed.iter().any(|todo| {
-        todo.completion_confidence
-            .is_none_or(|score| score < RUN_TODO_CONFIDENCE_THRESHOLD)
-    });
+    let completion_confidence_needs_validation = completed
+        .iter()
+        .any(|todo| !crate::todo::completion_confidence_passes(todo.completion_confidence));
     let confidence_spike_detected =
         allow_confidence_spike_challenge && !crate::todo::spike_completed_todos(todos).is_empty();
 
@@ -2659,13 +2656,13 @@ fn build_run_todo_validation_message(
     if completion_confidence_needs_validation {
         crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
         Some((
-            crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE.to_string(),
+            crate::todo::build_todo_completion_continuation_message(todos),
             false,
         ))
     } else {
         crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::ConfidenceSpike);
         Some((
-            crate::todo::TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE.to_string(),
+            crate::todo::build_todo_confidence_spike_continuation_message(todos),
             true,
         ))
     }

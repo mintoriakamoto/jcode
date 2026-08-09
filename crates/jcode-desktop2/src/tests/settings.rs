@@ -7,7 +7,7 @@
 
 use super::visual::Rendered;
 use crate::keymap::Action;
-use crate::settings::{ROWS, Row, Settings};
+use crate::settings::{CONFIG_ROWS, ROWS, Row, Settings};
 use crate::theme::ThemeMode;
 use crate::{App, states};
 
@@ -20,6 +20,7 @@ fn app() -> App {
         theme: ThemeMode::Light,
         reasoning: crate::reasoning::ReasoningMode::Current,
         motion: true,
+        copy_on_select: false,
     };
     // The window is pinned to match, so a developer whose saved theme is dark
     // does not see a different starting state than one whose is light.
@@ -51,6 +52,30 @@ fn clicking_the_gear_opens_and_shuts_the_panel() {
     assert!(app.model.panel.is_open(), "the gear did not open the panel");
     click(&mut app, x, y);
     assert!(!app.model.panel.is_open(), "the gear did not shut again");
+}
+
+#[test]
+fn clicking_sessions_opens_the_session_overview() {
+    let mut app = app();
+    let button = app.frame.sessions();
+    assert!(click(
+        &mut app,
+        button.x0 + button.width() / 2.0,
+        button.y0 + button.height() / 2.0,
+    ));
+    assert!(
+        app.model.overview.is_open(),
+        "sessions did not open the overview"
+    );
+}
+
+#[test]
+fn sessions_sits_at_the_top_left_of_the_page() {
+    let app = app();
+    let button = app.frame.sessions();
+    assert_eq!(button.x0, app.frame.left);
+    assert_eq!(button.y0, app.frame.gear().y0);
+    assert!(button.x1 < app.frame.gear().x0);
 }
 
 #[test]
@@ -125,6 +150,46 @@ fn every_row_reaches_the_running_window() {
         "the motion row did not reach the donut"
     );
     assert_eq!(app.model.donut.is_some(), app.model.settings.motion);
+}
+
+/// The `more` row opens the graphical configuration view in place. It must not
+/// launch an editor, dismiss the panel, or mutate a setting merely by opening.
+#[test]
+fn the_more_row_opens_the_graphical_configuration_view() {
+    let mut app = app();
+    app.model.panel.open();
+    let before = app.model.settings;
+    let index = ROWS
+        .iter()
+        .position(|row| *row == Row::More)
+        .expect("more row");
+    let band = app.frame.panel_row(ROWS.len(), index);
+    click(
+        &mut app,
+        band.x0 + band.width() / 2.0,
+        band.y0 + band.height() / 2.0,
+    );
+    assert_eq!(app.model.settings, before, "the more row changed a setting");
+    assert!(
+        app.model.panel.is_open(),
+        "the graphical view was dismissed"
+    );
+    assert_eq!(app.model.panel.rows(), CONFIG_ROWS);
+    assert!(CONFIG_ROWS.contains(&Row::CopyOnSelect));
+
+    let copy = CONFIG_ROWS
+        .iter()
+        .position(|row| *row == Row::CopyOnSelect)
+        .expect("copy-on-select row");
+    app.cycle_setting(copy);
+    assert_ne!(app.model.settings.copy_on_select, before.copy_on_select);
+
+    let back = CONFIG_ROWS
+        .iter()
+        .position(|row| *row == Row::Back)
+        .expect("back row");
+    app.cycle_setting(back);
+    assert_eq!(app.model.panel.rows(), ROWS);
 }
 
 #[test]
@@ -236,8 +301,12 @@ fn a_row_says_what_it_is_and_what_it_says() {
         assert!(!row.label().is_empty());
         assert!(!settings.value(*row).is_empty());
     }
-    assert_eq!(ROWS.len(), 3, "the panel grew: is every row worth a click?");
+    assert_eq!(ROWS.len(), 4, "the panel grew: is every row worth a click?");
     assert!(ROWS.contains(&Row::Theme));
+    // The escape hatch has to stay: the panel is deliberately small, so
+    // without a route to the config file the settings with no row would be
+    // unreachable from the app.
+    assert!(ROWS.contains(&Row::More));
 }
 
 /// The gear has to be findable without being loud: present in the margin, but
@@ -284,4 +353,27 @@ fn the_open_panel_covers_what_is_under_it() {
     // captions floating over the page.
     let border = r.darkest_in(panel.x0, panel.y0, panel.x1, panel.y0 + 1.5);
     assert!(border < 0.95, "the panel has no visible edge ({border:.3})");
+}
+
+/// The whole point of the row: with it on, highlighting text lands in the
+/// ordinary clipboard, and with it off the clipboard is left alone. Both
+/// halves matter, because the "off" half is what protects an explicit copy.
+#[test]
+fn copy_on_select_decides_whether_a_selection_reaches_the_clipboard() {
+    let mut app = app();
+    app.model.editor = crate::editor::Editor::with_text("hello world");
+    app.model.editor.move_to_start();
+    app.model.editor.extend_to(5);
+
+    app.publish_primary_selection();
+    assert_eq!(
+        app.clipboard.get(),
+        None,
+        "selecting text wrote to the clipboard with copy-on-select off"
+    );
+    assert_eq!(app.clipboard.primary(), Some("hello"));
+
+    app.model.settings.copy_on_select = true;
+    app.publish_primary_selection();
+    assert_eq!(app.clipboard.get().as_deref(), Some("hello"));
 }

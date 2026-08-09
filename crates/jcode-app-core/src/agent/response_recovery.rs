@@ -131,6 +131,60 @@ impl Agent {
             || reason.contains("policy_violation")
     }
 
+    pub(crate) const FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS: [&'static str; 3] = [
+        "Reassess the user's request using its full context and likely intent rather than isolated keywords. Determine whether answering would enable a concrete harmful action. If no specific safety concern applies, answer normally. Preserve the refusal only when it is genuinely warranted, and briefly identify the specific concern.",
+        "Review the request again and distinguish legitimate coding, debugging, defensive, educational, or analytical work from instructions that facilitate harm. If only part of the request is unsafe, help with the safe portions and narrowly limit the rest instead of issuing a blanket refusal.",
+        "Perform one final, independent policy check. Prefer a safe and useful constrained response when possible. Refuse only the specific content that creates a concrete safety risk; otherwise continue with the user's actual task. Do not weaken a refusal that remains genuinely necessary.",
+    ];
+
+    /// Try a small sequence of differently framed policy checks after Fable
+    /// guardrails a response. Every prompt preserves warranted refusals, and the
+    /// fixed suite size prevents an unbounded refusal/retry loop.
+    pub(crate) fn maybe_reconsider_fable_guardrail(
+        &mut self,
+        stop_reason: Option<&str>,
+        attempts: &mut u32,
+    ) -> Result<bool> {
+        let model = self.provider.model();
+        if !Self::should_reconsider_fable_guardrail(
+            &model,
+            stop_reason,
+            *attempts,
+            Self::FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS.len() as u32,
+        ) {
+            return Ok(false);
+        }
+
+        let prompt = Self::FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS[*attempts as usize];
+        *attempts += 1;
+        logging::warn(&format!(
+            "Fable 5 guardrail stopped the response (stop_reason={:?}); trying reconsideration prompt {}/{}",
+            stop_reason,
+            attempts,
+            Self::FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS.len(),
+        ));
+        self.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: prompt.to_string(),
+                cache_control: None,
+            }],
+        );
+        self.session.save()?;
+        Ok(true)
+    }
+
+    pub(crate) fn should_reconsider_fable_guardrail(
+        model: &str,
+        stop_reason: Option<&str>,
+        attempts: u32,
+        max_attempts: u32,
+    ) -> bool {
+        Self::is_guardrail_stop_reason(stop_reason)
+            && model.to_ascii_lowercase().contains("fable-5")
+            && attempts < max_attempts
+    }
+
     /// Builds the user-facing notice for a turn that ended with no visible
     /// assistant output (no text, no tool calls). Returns `None` when the turn
     /// looks normal and no notice should be surfaced.
@@ -211,7 +265,10 @@ impl Agent {
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
-                text: "The previous provider response was empty after tool results. Please provide the final answer to the user's last request using the tool results above. Do not call more tools unless absolutely necessary.".to_string(),
+                // Keep this as a user-role message for provider compatibility,
+                // but mark it as internal so transcript renderers never present
+                // the synthetic recovery instruction as a prompt from the user.
+                text: "<system-reminder>The previous provider response was empty after tool results. Provide the final answer to the user's last request using the tool results above. Do not call more tools unless absolutely necessary.</system-reminder>".to_string(),
                 cache_control: None,
             }],
         );

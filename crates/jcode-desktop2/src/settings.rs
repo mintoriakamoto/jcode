@@ -21,17 +21,34 @@ pub enum Row {
     Theme,
     Reasoning,
     Motion,
+    CopyOnSelect,
+    /// Not a setting of its own: opens `~/.jcode/config.toml`, where the rest
+    /// of jcode's configuration lives. The panel is for the handful of choices
+    /// worth a click; everything else belongs in the file, and this row is the
+    /// way there rather than a second copy of it.
+    More,
+    Back,
 }
 
 /// Every row, in the order the panel draws them.
-pub const ROWS: &[Row] = &[Row::Theme, Row::Reasoning, Row::Motion];
+pub const ROWS: &[Row] = &[Row::Theme, Row::Reasoning, Row::Motion, Row::More];
+pub const CONFIG_ROWS: &[Row] = &[
+    Row::Theme,
+    Row::Reasoning,
+    Row::Motion,
+    Row::CopyOnSelect,
+    Row::Back,
+];
 
 impl Row {
     pub fn label(self) -> &'static str {
         match self {
             Self::Theme => "theme",
-            Self::Reasoning => "thinking",
+            Self::Reasoning => "reasoning display",
             Self::Motion => "motion",
+            Self::CopyOnSelect => "copy on select",
+            Self::More => "more",
+            Self::Back => "back",
         }
     }
 }
@@ -44,6 +61,17 @@ pub struct Settings {
     pub reasoning: ReasoningMode,
     /// Whether the hero donut animates. Off is the reduced-motion choice.
     pub motion: bool,
+    /// Whether highlighting text also writes it to the ordinary clipboard.
+    ///
+    /// Off by default: a selection always fills the primary selection, and
+    /// overwriting the real clipboard on every drag is destructive enough that
+    /// it has to be asked for. On, it is the terminal-style behaviour people
+    /// come here expecting.
+    ///
+    /// Not in the panel: it is set once and never again, so it lives in the
+    /// settings file and `JCODE_DESKTOP2_COPY_ON_SELECT` rather than spending
+    /// a row on a click nobody repeats.
+    pub copy_on_select: bool,
 }
 
 impl Default for Settings {
@@ -52,7 +80,23 @@ impl Default for Settings {
             theme: ThemeMode::System,
             reasoning: ReasoningMode::default(),
             motion: true,
+            copy_on_select: false,
         }
+    }
+}
+
+/// The word a boolean row shows.
+const fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
+}
+
+/// Parse a boolean row's saved value, tolerating the spellings a hand-edited
+/// file is likely to contain.
+fn parse_on_off(value: &str) -> Option<bool> {
+    match value {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -66,13 +110,10 @@ impl Settings {
                 ThemeMode::System => "system",
             },
             Row::Reasoning => self.reasoning.label(),
-            Row::Motion => {
-                if self.motion {
-                    "on"
-                } else {
-                    "off"
-                }
-            }
+            Row::Motion => on_off(self.motion),
+            Row::CopyOnSelect => on_off(self.copy_on_select),
+            Row::More => "settings",
+            Row::Back => "general",
         }
     }
 
@@ -86,6 +127,10 @@ impl Settings {
             Row::Theme => self.theme = self.next_theme(system_dark),
             Row::Reasoning => self.reasoning = self.reasoning.cycle(),
             Row::Motion => self.motion = !self.motion,
+            Row::CopyOnSelect => self.copy_on_select = !self.copy_on_select,
+            // Nothing to cycle: the app opens the file. Kept a no-op here so
+            // the pure state can never be surprised by a row that acts.
+            Row::More | Row::Back => {}
         }
     }
 
@@ -131,15 +176,18 @@ impl Settings {
             theme: crate::theme::Theme::preference_from_env(),
             reasoning: ReasoningMode::from_env(),
             motion: !crate::donut_disabled(),
+            copy_on_select: std::env::var("JCODE_DESKTOP2_COPY_ON_SELECT")
+                .is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true")),
         }
     }
 
     pub fn serialize(&self) -> String {
         format!(
-            "theme={}\nthinking={}\nmotion={}\n",
+            "theme={}\nreasoning_display={}\nmotion={}\ncopy_on_select={}\n",
             self.value(Row::Theme),
             self.value(Row::Reasoning),
             self.value(Row::Motion),
+            on_off(self.copy_on_select),
         )
     }
 
@@ -159,16 +207,24 @@ impl Settings {
                     "system" => settings.theme = ThemeMode::System,
                     _ => {}
                 },
-                "thinking" => {
+                // `thinking` is the key this file used before the row was
+                // renamed; still read so an existing settings file keeps its
+                // choice.
+                "reasoning_display" | "thinking" => {
                     if let Some(mode) = ReasoningMode::parse(value) {
                         settings.reasoning = mode;
                     }
                 }
-                "motion" => match value {
-                    "on" | "true" | "1" => settings.motion = true,
-                    "off" | "false" | "0" => settings.motion = false,
-                    _ => {}
-                },
+                "motion" => {
+                    if let Some(on) = parse_on_off(value) {
+                        settings.motion = on;
+                    }
+                }
+                "copy_on_select" => {
+                    if let Some(on) = parse_on_off(value) {
+                        settings.copy_on_select = on;
+                    }
+                }
                 _ => {}
             }
         }
@@ -187,6 +243,12 @@ impl Settings {
     /// Load the saved settings over the environment's defaults. A missing file
     /// is normal; any other failure is reported rather than hidden.
     pub fn load() -> Self {
+        // Never under test: a test that reads the developer's own saved file
+        // passes or fails depending on whose machine it runs on, which is how
+        // `copy_on_select=on` in one home directory broke the selection tests.
+        if cfg!(test) {
+            return Self::default();
+        }
         let base = Self::from_env();
         let Some(path) = Self::path() else {
             return base;
@@ -234,6 +296,7 @@ impl Settings {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Panel {
     open: bool,
+    config: bool,
     hover: Option<usize>,
 }
 
@@ -248,6 +311,7 @@ impl Panel {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.config = false;
         self.hover = None;
     }
 
@@ -265,10 +329,24 @@ impl Panel {
         self.hover.filter(|_| self.open)
     }
 
+    pub fn rows(&self) -> &'static [Row] {
+        if self.config { CONFIG_ROWS } else { ROWS }
+    }
+
+    pub fn show_config(&mut self) {
+        self.config = true;
+        self.hover = None;
+    }
+
+    pub fn show_general(&mut self) {
+        self.config = false;
+        self.hover = None;
+    }
+
     /// Point the highlight at a row. Returns whether anything changed, so the
     /// caller only repaints on a real move.
     pub fn set_hover(&mut self, row: Option<usize>) -> bool {
-        let row = row.filter(|index| *index < ROWS.len());
+        let row = row.filter(|index| *index < self.rows().len());
         if self.hover == row {
             return false;
         }
@@ -287,6 +365,7 @@ mod tests {
             theme: ThemeMode::Dark,
             reasoning: ReasoningMode::Off,
             motion: false,
+            copy_on_select: true,
         };
         assert_eq!(
             Settings::parse_over(Settings::default(), &settings.serialize()),
@@ -296,7 +375,14 @@ mod tests {
 
     #[test]
     fn corrupt_content_keeps_the_defaults() {
-        for text in ["garbage", "theme=", "=x", "\0\0", "motion=maybe"] {
+        for text in [
+            "garbage",
+            "theme=",
+            "=x",
+            "\0\0",
+            "motion=maybe",
+            "copy_on_select=maybe",
+        ] {
             assert_eq!(
                 Settings::parse_over(Settings::default(), text),
                 Settings::default(),
@@ -305,17 +391,28 @@ mod tests {
         }
     }
 
+    /// Off by default: highlighting text must not destroy whatever the user
+    /// deliberately copied unless they asked for that. Set from the file or
+    /// the environment, not from the panel.
+    #[test]
+    fn copy_on_select_is_off_until_asked_for() {
+        assert!(!Settings::default().copy_on_select);
+        assert!(Settings::parse_over(Settings::default(), "copy_on_select=on\n").copy_on_select);
+    }
+
     #[test]
     fn a_partial_file_leaves_the_other_keys_alone() {
         let base = Settings {
             theme: ThemeMode::Dark,
             reasoning: ReasoningMode::Full,
             motion: false,
+            copy_on_select: true,
         };
         let parsed = Settings::parse_over(base, "theme=light\n");
         assert_eq!(parsed.theme, ThemeMode::Light);
         assert_eq!(parsed.reasoning, ReasoningMode::Full);
         assert!(!parsed.motion);
+        assert!(parsed.copy_on_select);
     }
 
     #[test]

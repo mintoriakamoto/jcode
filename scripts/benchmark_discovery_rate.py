@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Call-rate benchmark for `discover_tools`.
+"""Call-rate benchmark for `integration_tools`.
 
 Where `benchmark_discovery.py` asks "did the agent reach the expected catalog
 listing", this runner asks the two questions that define the intended policy:
 
 1. Recall: when a task needs an external product, service, API, or data source,
-   does the agent call `discover_tools` at all (browse phase)?
+   does the agent call `integration_tools` at all (search/browse phase)?
 2. Select discipline: when the agent then commits to a specific product, does
-   that commitment go through `discover_tools` action=select, or does it bypass
+   that commitment go through `integration_tools` action=select, or does it bypass
    Discovery entirely by installing an SDK, hitting a vendor URL, or connecting
    an MCP server directly?
+3. Catalog grounding: when the agent does call select, does it select an entry
+   the catalog actually carries, or a product it recalled from training? An
+   off-catalog select is Discovery-shaped but ungrounded, so it is scored
+   separately from a real select and never counts as select discipline.
 
 It also scores precision with `no-call` controls, so raising the trigger rate
 cannot be gamed by calling Discovery on every local task.
@@ -21,10 +25,12 @@ its own, and it kills each attempt as soon as the case is decided.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -42,8 +48,10 @@ from benchmark_discovery import (  # noqa: E402
     BENCHMARK_ENV,
     BENCHMARK_HEADER,
     BenchmarkError,
+    DiscoveryCall,
     benchmark_environment,
     load_categories,
+    DISCOVERY_TOOL_NAMES,
     parse_discovery_output,
     progress,
     start_server,
@@ -55,6 +63,49 @@ from benchmark_discovery import (  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CASES = REPO_ROOT / "scripts" / "discovery_rate_cases.json"
 DEFAULT_OUTPUT = REPO_ROOT / "target" / "discovery-rate/latest.json"
+REPORT_VERSION = 2
+
+
+def executable_identity(command: str) -> dict[str, Any]:
+    """Resolve and fingerprint the exact Jcode binary used by this run."""
+    candidate = Path(command).expanduser()
+    resolved: Path | None = None
+    if candidate.is_absolute() or candidate.parent != Path("."):
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as error:
+            raise BenchmarkError(f"Jcode executable does not exist: {command}: {error}") from error
+    else:
+        found = shutil.which(command)
+        if found:
+            resolved = Path(found).resolve()
+    if resolved is None or not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise BenchmarkError(f"Jcode executable is not runnable: {command}")
+
+    digest = hashlib.sha256()
+    with resolved.open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+            digest.update(chunk)
+    try:
+        version_result = subprocess.run(
+            [str(resolved), "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise BenchmarkError(f"Could not identify Jcode executable {resolved}: {error}") from error
+    version = version_result.stdout.strip()
+    commit_match = re.search(r"\(([0-9a-f]{7,40})(?=[, )-])", version, re.IGNORECASE)
+    return {
+        "argument": command,
+        "path": str(resolved),
+        "version": version,
+        "commit": commit_match.group(1) if commit_match else None,
+        "sha256": digest.hexdigest(),
+        "size_bytes": resolved.stat().st_size,
+    }
 
 # A trial that never reached the model (auth expiry, provider outage, crash)
 # says nothing about triggering behavior. Such trials are marked invalid and
@@ -82,9 +133,14 @@ VENDOR_CLIS = (
     "vercel|stripe|supabase|neonctl|railway|flyctl|heroku|wrangler|doctl|netlify|"
     "planetscale|pscale|sentry-cli|datadog-ci|clerk|auth0|twilio|sendgrid|resend"
 )
+# A package install only counts when a package name follows. `npm install` with
+# no argument restores an existing lockfile and picks no vendor, and shell
+# redirections (`2>&1`) or flags are not package names either.
+_PKG_ARG = r"\b(?:{mgr})\s+(?:{verb})\s+(?![-.]|\d*[<>|&])[A-Za-z@][\w@/.-]*"
+
 BYPASS_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("package-install", re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+(?:add|install)\s+(?![-.]|$)\S", re.I)),
-    ("package-install", re.compile(r"\b(?:pip|pip3|uv)\s+(?:install|add)\s+(?![-.]|$)\S", re.I)),
+    ("package-install", re.compile(_PKG_ARG.format(mgr="npm|pnpm|yarn|bun", verb="add|install"), re.I)),
+    ("package-install", re.compile(_PKG_ARG.format(mgr="pip|pip3|uv", verb="install|add"), re.I)),
     ("package-install", re.compile(r"\bcargo\s+add\s+\w", re.I)),
     ("package-install", re.compile(r"\bgo\s+get\s+\w+\.\w", re.I)),
     ("vendor-cli", re.compile(_CMD_HEAD + rf"(?:{VENDOR_CLIS})\s+[a-z]", re.I | re.M)),
@@ -102,6 +158,8 @@ class RateCase:
     expect: str
     prompt: str
     expected_category: str | None = None
+    expected_tool: str | None = None
+    expected_listed: bool | None = None
     tags: tuple[str, ...] = ()
 
 
@@ -128,8 +186,10 @@ class TrialResult:
     browsed: bool
     browse_categories: list[str] = field(default_factory=list)
     selected_via_discovery: list[str] = field(default_factory=list)
+    off_catalog_selects: list[str] = field(default_factory=list)
     first_call_seconds: float | None = None
     category_correct: bool | None = None
+    selection_correct: bool | None = None
     bypasses: list[Bypass] = field(default_factory=list)
     discovery_calls: list[dict[str, Any]] = field(default_factory=list)
     other_tool_calls: list[str] = field(default_factory=list)
@@ -157,6 +217,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--min-recall", type=float, default=0.8, help="Required browse rate on `call` cases.")
     parser.add_argument("--min-precision", type=float, default=0.9, help="Required clean rate on `no-call` controls.")
+    parser.add_argument(
+        "--min-selection-accuracy",
+        type=float,
+        default=1.0,
+        help="Required exact selection rate on `select` cases.",
+    )
     parser.add_argument("--retry-delay", type=float, default=0.5)
     parser.add_argument(
         "--invalid-retries",
@@ -174,6 +240,9 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.trials < 1 or args.timeout <= 0:
         parser.error("--trials must be >= 1 and --timeout must be positive")
+    for name in ("min_recall", "min_precision", "min_selection_accuracy"):
+        if not 0 <= getattr(args, name) <= 1:
+            parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
     return args
 
 
@@ -190,12 +259,25 @@ def load_cases(path: Path, categories: list[str]) -> list[RateCase]:
             expect=str(raw.get("expect", "")).strip().lower(),
             prompt=str(raw.get("prompt", "")).strip(),
             expected_category=(str(raw.get("expected_category") or "").strip().lower() or None),
+            expected_tool=(str(raw.get("expected_tool") or "").strip().lower() or None),
+            expected_listed=raw.get("expected_listed"),
             tags=tuple(str(tag).strip().lower() for tag in raw.get("tags", [])),
         )
         if not case.id or not case.prompt:
             raise BenchmarkError(f"rate case has an empty id or prompt: {raw}")
-        if case.expect not in {"call", "no-call"}:
-            raise BenchmarkError(f"case {case.id}: expect must be 'call' or 'no-call'")
+        if case.expect not in {"call", "no-call", "select"}:
+            raise BenchmarkError(f"case {case.id}: expect must be 'call', 'no-call', or 'select'")
+        if case.expect == "select":
+            if not case.expected_category or not case.expected_tool:
+                raise BenchmarkError(
+                    f"case {case.id}: select cases require expected_category and expected_tool"
+                )
+            if not isinstance(case.expected_listed, bool):
+                raise BenchmarkError(f"case {case.id}: select cases require boolean expected_listed")
+        elif case.expected_tool is not None or case.expected_listed is not None:
+            raise BenchmarkError(
+                f"case {case.id}: only select cases may declare expected_tool or expected_listed"
+            )
         if case.expect == "no-call" and case.expected_category:
             raise BenchmarkError(f"case {case.id}: no-call cases must not declare a category")
         if case.expected_category and case.expected_category not in categories:
@@ -207,7 +289,7 @@ def load_cases(path: Path, categories: list[str]) -> list[RateCase]:
         if normalized in seen_prompts:
             raise BenchmarkError(f"duplicate rate prompt in case {case.id}")
         # Prompts must not hint at the mechanism or the taxonomy.
-        for leak in ("discover_tools", "tool discovery", "discovery tool", "catalog"):
+        for leak in ("discover_tools", "integration_tools", "tool discovery", "discovery tool", "catalog"):
             if leak in lowered:
                 raise BenchmarkError(f"case {case.id} leaks Discovery into the prompt ({leak!r})")
         for category in categories:
@@ -258,6 +340,46 @@ def detect_bypasses(tool: str, text: str, elapsed: float) -> list[Bypass]:
                 )
             )
     return found
+
+
+def parse_tool_input(text: str) -> tuple[str | None, str | None, str | None]:
+    """Return normalized action, tool, and stated reason from one tool input."""
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None, None, None
+    if not isinstance(value, dict):
+        return None, None, None
+    action = str(value.get("action") or "").strip().lower() or None
+    tool = str(value.get("tool") or "").strip().lower() or None
+    reason = str(value.get("reason") or "").strip() or None
+    return action, tool, reason
+
+
+def selection_is_correct(
+    case: RateCase,
+    call: DiscoveryCall,
+    action: str | None,
+    tool: str | None,
+    reason: str | None,
+) -> bool:
+    """Require the select input, stated reason, and receipt to agree with the case."""
+    return (
+        case.expect == "select"
+        and action == "select"
+        and tool == case.expected_tool
+        and reason is not None
+        and len(reason) >= 40
+        and call.outcome == "selection"
+        and call.tools == [case.expected_tool]
+        and call.category == case.expected_category
+        and call.listed is case.expected_listed
+    )
+
+
+def discovery_call_stops_trial(case: RateCase, is_selection: bool) -> bool:
+    """Controls stop on any call; every case stops once a product is selected."""
+    return case.expect == "no-call" or is_selection
 
 
 def _pump(stream: Any, source: str, messages: queue.Queue[tuple[str, str | None]]) -> None:
@@ -351,10 +473,14 @@ def run_trial(args: argparse.Namespace, case: RateCase, trial: int, socket_path:
             name = str(event.get("name", ""))
             output = str(event.get("output", ""))
             tool_input = pending_input.pop(str(event.get("id", "")), "")
-            if name == "discover_tools":
+            if name in DISCOVERY_TOOL_NAMES:
                 call = parse_discovery_output(output, elapsed)
                 record = asdict(call)
                 record["input"] = tool_input[:2000]
+                input_action, input_tool, input_reason = parse_tool_input(tool_input)
+                record["input_action"] = input_action
+                record["input_tool"] = input_tool
+                record["input_reason"] = input_reason
                 result.discovery_calls.append(record)
                 if result.first_call_seconds is None:
                     result.first_call_seconds = round(elapsed, 3)
@@ -362,10 +488,16 @@ def run_trial(args: argparse.Namespace, case: RateCase, trial: int, socket_path:
                     result.browsed = True
                     if call.category:
                         result.browse_categories.append(call.category)
-                elif call.outcome == "selection" and call.tools:
-                    result.selected_via_discovery.append(call.tools[0])
-                if case.expect == "no-call":
-                    # A control is decided by the first Discovery call.
+                is_selection = input_action == "select" or call.outcome == "selection"
+                if input_action == "select" and input_tool:
+                    result.selected_via_discovery.append(input_tool)
+                if case.expect == "select" and is_selection:
+                    result.selection_correct = selection_is_correct(
+                        case, call, input_action, input_tool, input_reason
+                    )
+                if discovery_call_stops_trial(case, is_selection):
+                    # A control is decided by its first call. A product choice
+                    # decides every case before a consequential action can run.
                     decided = True
                     break
             else:
@@ -402,12 +534,25 @@ def run_trial(args: argparse.Namespace, case: RateCase, trial: int, socket_path:
 
     if case.expect == "no-call":
         result.outcome = "false-positive" if result.discovery_calls else "clean"
+    elif case.expect == "select":
+        if result.selection_correct is True:
+            result.outcome = "selected"
+        elif result.selection_correct is False:
+            result.outcome = "incorrect-selection"
+        elif result.bypasses:
+            result.outcome = "bypassed"
+        else:
+            result.outcome = "no-selection"
     elif result.browsed:
         result.outcome = "browsed"
     elif result.selected_via_discovery:
         # Went straight to select without browsing: Discovery was used, but the
         # unbiased compare step was skipped.
         result.outcome = "select-without-browse"
+    elif result.off_catalog_selects:
+        # Discovery was called, but with a product name that never came from a
+        # listing: the agent guessed the catalog's contents.
+        result.outcome = "off-catalog-select"
     elif result.bypasses:
         result.outcome = "bypassed"
     else:
@@ -423,9 +568,10 @@ def summarize_case(case: RateCase, trials: list[TrialResult]) -> dict[str, Any]:
     browsed = [trial for trial in scored if trial.browsed]
     bypassed = [trial for trial in scored if trial.bypasses and not trial.discovery_calls]
     selects = [trial for trial in scored if trial.selected_via_discovery]
+    off_catalog = [trial for trial in scored if trial.off_catalog_selects]
     category_scored = [trial for trial in scored if trial.category_correct is not None]
     first_call_times = [trial.first_call_seconds for trial in scored if trial.first_call_seconds is not None]
-    wanted = "clean" if case.expect == "no-call" else "browsed"
+    wanted = {"no-call": "clean", "call": "browsed", "select": "selected"}[case.expect]
     passed = bool(scored) and all(trial.outcome == wanted for trial in scored)
 
     def rate(subset: list[TrialResult]) -> float | None:
@@ -441,6 +587,11 @@ def summarize_case(case: RateCase, trials: list[TrialResult]) -> dict[str, Any]:
         "browse_rate": rate(browsed),
         "bypass_rate": rate(bypassed),
         "select_rate": rate(selects),
+        "selection_accuracy": (
+            sum(trial.selection_correct is True for trial in scored) / total
+            if case.expect == "select" and total
+            else None
+        ),
         "category_accuracy": (
             sum(1 for trial in category_scored if trial.category_correct) / len(category_scored)
             if category_scored
@@ -461,6 +612,7 @@ def summarize_case(case: RateCase, trials: list[TrialResult]) -> dict[str, Any]:
 def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
     call_cases = [result for result in results if result["case"]["expect"] == "call"]
     control_cases = [result for result in results if result["case"]["expect"] == "no-call"]
+    select_cases = [result for result in results if result["case"]["expect"] == "select"]
 
     def mean(values: list[float]) -> float | None:
         values = [value for value in values if value is not None]
@@ -469,15 +621,20 @@ def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
     category_scores = [
         result["category_accuracy"] for result in call_cases if result["category_accuracy"] is not None
     ]
+    action_cases = call_cases + select_cases
     return {
         "call_case_count": len(call_cases),
         "control_case_count": len(control_cases),
+        "select_case_count": len(select_cases),
         "invalid_trial_count": sum(result["invalid_trial_count"] for result in results),
         "scored_trial_count": sum(result["scored_trial_count"] for result in results),
         "recall_browse_rate": mean([result["browse_rate"] for result in call_cases]),
         "recall_any_call_rate": mean([result["call_rate"] for result in call_cases]),
         "bypass_rate": mean([result["bypass_rate"] for result in call_cases]),
-        "select_rate": mean([result["select_rate"] for result in call_cases]),
+        "select_rate": mean([result["select_rate"] for result in action_cases]),
+        "selection_accuracy": mean(
+            [result["selection_accuracy"] for result in select_cases]
+        ),
         "category_accuracy": mean(category_scores),
         "control_clean_rate": mean(
             [1.0 - result["call_rate"] for result in control_cases if result["call_rate"] is not None]
@@ -495,6 +652,25 @@ def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def passes_gates(
+    summary: dict[str, Any],
+    min_recall: float,
+    min_precision: float,
+    min_selection_accuracy: float,
+) -> bool:
+    """Apply only gates for case families represented by scored trials."""
+    if summary["scored_trial_count"] <= 0:
+        return False
+    return all(
+        value is None or value >= minimum
+        for value, minimum in (
+            (summary["recall_browse_rate"], min_recall),
+            (summary["control_clean_rate"], min_precision),
+            (summary["selection_accuracy"], min_selection_accuracy),
+        )
+    )
+
+
 def main() -> int:
     args = parse_args()
     started_at = datetime.now(timezone.utc)
@@ -503,10 +679,19 @@ def main() -> int:
 
     if args.list:
         for case in cases:
-            marker = "call" if case.expect == "call" else "CTRL"
-            print(f"{marker:5} {case.id:38} {case.expected_category or '-':24} {case.prompt[:70]}")
+            marker = {"call": "call", "no-call": "CTRL", "select": "SEL"}[case.expect]
+            target = case.expected_tool or "-"
+            print(
+                f"{marker:5} {case.id:38} {case.expected_category or '-':24} "
+                f"{target:16} {case.prompt[:70]}"
+            )
         print(f"\n{len(cases)} cases")
         return 0
+
+    executable = executable_identity(args.jcode)
+    # Pin the resolved binary path so a symlink update during the run cannot
+    # make the recorded identity differ from later trials.
+    args.jcode = executable["path"]
 
     results: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="jcode-discovery-rate-") as temp_dir:
@@ -548,16 +733,16 @@ def main() -> int:
     summary = aggregate(results)
     recall = summary["recall_browse_rate"]
     precision = summary["control_clean_rate"]
-    # A run with nothing scored is not a pass. Gate on real measurements only.
-    enough_signal = summary["scored_trial_count"] > 0 and recall is not None
-    passed = (
-        enough_signal
-        and recall >= args.min_recall
-        and (precision is None or precision >= args.min_precision)
+    selection_accuracy = summary["selection_accuracy"]
+    passed = passes_gates(
+        summary,
+        args.min_recall,
+        args.min_precision,
+        args.min_selection_accuracy,
     )
     report = {
         "benchmark": "discovery-call-rate",
-        "version": 1,
+        "version": REPORT_VERSION,
         "started_at": started_at.isoformat(),
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "benchmark_marker": {
@@ -566,6 +751,7 @@ def main() -> int:
             "telemetry_field": "benchmark_run=true",
         },
         "config": {
+            "executable": executable,
             "model": args.model,
             "provider": args.provider,
             "trials": args.trials,
@@ -573,6 +759,7 @@ def main() -> int:
             "cases_file": str(args.cases),
             "min_recall": args.min_recall,
             "min_precision": args.min_precision,
+            "min_selection_accuracy": args.min_selection_accuracy,
         },
         "summary": summary,
         "results": results,
@@ -589,6 +776,10 @@ def main() -> int:
     print(f"  Any Discovery call on those cases:     {_pct(summary['recall_any_call_rate'])}")
     print(f"  Bypassed Discovery entirely:           {_pct(summary['bypass_rate'])}")
     print(f"  Reached action=select:                 {_pct(summary['select_rate'])}")
+    print(
+        f"  Exact selection accuracy:              {_pct(selection_accuracy)} "
+        f"(gate {args.min_selection_accuracy:.0%})"
+    )
     print(f"  Correct category when browsing:        {_pct(summary['category_accuracy'])}")
     print(f"  Controls left clean:                   {_pct(precision)} (gate {args.min_precision:.0%})")
     if summary["failing_controls"]:
@@ -599,6 +790,7 @@ def main() -> int:
         print(
             f"    {case['id']:38} {case['expect']:8} browse={_pct(result['browse_rate'])} "
             f"bypass={_pct(result['bypass_rate'])} select={_pct(result['select_rate'])} "
+            f"accuracy={_pct(result['selection_accuracy'])} "
             f"{'invalid=' + str(result['invalid_trial_count']) + ' ' if result['invalid_trial_count'] else ''}"
             f"{'' if result['passed'] else 'FAIL'}"
         )

@@ -1381,6 +1381,63 @@ fn guardrail_stop_reason_detection() {
 }
 
 #[test]
+fn fable_guardrail_reconsideration_is_narrow_and_bounded() {
+    assert!(Agent::should_reconsider_fable_guardrail(
+        "claude-fable-5",
+        Some("refusal"),
+        0,
+        1,
+    ));
+    assert!(Agent::should_reconsider_fable_guardrail(
+        "CLAUDE-FABLE-5-20260801",
+        Some("content_filter"),
+        0,
+        1,
+    ));
+    assert!(Agent::should_reconsider_fable_guardrail(
+        "claude-fable-5",
+        Some("refusal"),
+        1,
+        3,
+    ));
+    assert!(Agent::should_reconsider_fable_guardrail(
+        "claude-fable-5",
+        Some("refusal"),
+        2,
+        3,
+    ));
+    assert!(!Agent::should_reconsider_fable_guardrail(
+        "claude-fable-5",
+        Some("refusal"),
+        3,
+        3,
+    ));
+    assert!(!Agent::should_reconsider_fable_guardrail(
+        "claude-fable-5",
+        Some("end_turn"),
+        0,
+        1,
+    ));
+    assert!(!Agent::should_reconsider_fable_guardrail(
+        "claude-opus-5",
+        Some("refusal"),
+        0,
+        1,
+    ));
+}
+
+#[test]
+fn fable_guardrail_prompt_suite_is_distinct_and_safety_preserving() {
+    let prompts = Agent::FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS;
+    assert_eq!(prompts.len(), 3);
+    assert_ne!(prompts[0], prompts[1]);
+    assert_ne!(prompts[1], prompts[2]);
+    assert!(prompts[0].contains("full context"));
+    assert!(prompts[1].contains("safe portions"));
+    assert!(prompts[2].contains("Do not weaken a refusal"));
+}
+
+#[test]
 fn guardrail_notice_for_refusal_stop() {
     let notice = Agent::provider_guardrail_notice(Some("refusal"), true, true)
         .expect("refusal with empty text must produce a notice");
@@ -1456,6 +1513,23 @@ async fn empty_post_tool_response_is_retried_in_shared_helper() {
         .expect("helper must not error");
     assert!(retried);
     assert_eq!(attempts, 1);
+    let recovery = agent
+        .session
+        .messages
+        .last()
+        .expect("recovery instruction must be persisted");
+    assert_eq!(recovery.role, Role::User);
+    assert!(
+        recovery
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .is_some_and(|text| text.starts_with("<system-reminder>")),
+        "synthetic recovery instruction must be hidden from the transcript"
+    );
 
     // A guardrail refusal is deliberate and must not be retried.
     let retried = agent
@@ -1581,5 +1655,106 @@ async fn stranded_tool_use_stop_continues_instead_of_ending_the_turn() {
     assert!(
         text.contains("all done"),
         "the recovered turn must deliver the model's real completion, got {text:?}"
+    );
+}
+
+#[derive(Clone, Default)]
+struct FableGuardrailProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+    prompts_seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for FableGuardrailProvider {
+    async fn complete(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        if call > 1 {
+            let prompt = messages
+                .last()
+                .map(message_text)
+                .unwrap_or_default()
+                .to_string();
+            self.prompts_seen.lock().unwrap().push(prompt);
+        }
+
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
+        tokio::spawn(async move {
+            if call <= 3 {
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("refusal".to_string()),
+                    }))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(Ok(StreamEvent::TextDelta(
+                        "Reconsidered and completed safely".to_string(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "anthropic"
+    }
+
+    fn model(&self) -> String {
+        "claude-fable-5".to_string()
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
+    let _guard = crate::storage::lock_test_env();
+    let fable = FableGuardrailProvider::default();
+    let calls = fable.calls.clone();
+    let prompts_seen = fable.prompts_seen.clone();
+    let provider: Arc<dyn Provider> = Arc::new(fable);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do this ordinary coding task", Vec::new(), None, tx)
+        .await
+        .expect("turn should recover from the guardrail");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+
+    assert_eq!(*calls.lock().unwrap(), 4);
+    let prompts = prompts_seen.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[0].contains("concrete harmful action"));
+    assert!(prompts[1].contains("safe portions"));
+    assert!(prompts[2].contains("final, independent policy check"));
+    assert!(
+        text.contains("Reconsidered and completed safely"),
+        "{text:?}"
     );
 }

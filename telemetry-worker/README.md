@@ -41,12 +41,14 @@ Events are dual-written to two stores with different jobs:
 
 ### D1 size self-defense
 
-D1 hard-caps databases at 500 MB on the free plan; at the cap every insert
-500s and telemetry silently stops (June 2026: ~3 days lost). Defenses, in
-order:
+D1 hard-caps databases at 10 GB on Workers Paid (500 MB on Free). The first
+5 GB of account-wide paid storage is included. The worker therefore uses a
+4.5 GB soft limit, leaving room for other databases and for pruning to catch
+up before the 10 GB hard cap. At the old free-plan cap every insert failed and
+telemetry silently stopped (June 2026: ~3 days lost). Defenses, in order:
 
 - The worker observes `meta.size_after` on every D1 write. Past the soft
-  limit (`D1_SOFT_LIMIT_BYTES`, just above the file's high-water mark) it
+  budget limit (`D1_SOFT_LIMIT_BYTES`) it
   triggers an **emergency prune** (halved retention windows, rate-limited to
   one per 10 minutes per isolate) instead of waiting for the nightly cron.
 - If an insert fails with a SQLITE_FULL-class error, the emergency prune runs
@@ -183,6 +185,36 @@ Three things to know before quoting the number:
 - **Check `priced_token_pct` / `unpriced_tokens`.** Every panel reports them.
   If coverage drops, re-run the sync before trusting the dollar figure.
 
+
+## Reading DAU without fooling yourself
+
+`npm run dau` leads with `headline_users_24h` (= `meaningful_release_24h_noci`):
+real users, release channel, CI excluded. Use that number.
+
+Two traps the panel now guards against:
+
+- **Partial day.** The `today` tiers cover a partial UTC day, so every morning
+  they look like a cliff. `day_elapsed_pct` plus `release_users_sofar` /
+  `..._yday` / `..._7d` compare today against the *same clock window* on prior
+  days, and `pace_vs_yday` / `pace_vs_7d` are the ratios (>1.0 = ahead). These
+  are same-window comparisons, not extrapolations, because DAU is a distinct
+  count and does not scale linearly with elapsed time.
+- **Dev-build traffic.** `debug` and `git_checkout` ids are overwhelmingly
+  throwaway: a `session_start` and an `onboarding_step`, no `session_end`
+  (7-day completion ratio 0.02 for `debug` vs 0.21 for `release`). Their volume
+  swings ~5x day to day, which is enough to make a flat week look like
+  alternating spikes and cliffs in any raw-id metric. `dev_build_24h` tracks
+  them so the swing is visible instead of silently moving the headline.
+
+This is also why the overall `lifecycle_completion_ratio` in `health.sql` is
+low: it is a blend across channels, and the dev channels drag it down.
+
+Release's own ratio was ~0.25 for a separate reason: `begin_session` replaced
+a live in-process session without ending it, so every superseded session's
+`session_start` was orphaned. Those now emit a `session_end` with
+`session_stop_reason = 'superseded'`. Expect the release ratio to climb as
+clients upgrade, and expect `superseded` to be a large share of ends: it means
+one process opened several sessions, not that anything failed.
 
 ## Event types
 

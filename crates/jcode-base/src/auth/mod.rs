@@ -8,6 +8,7 @@ mod commands;
 pub mod copilot;
 pub mod cursor;
 pub mod doctor;
+pub mod env_facts;
 pub mod external;
 pub mod gemini;
 pub mod google;
@@ -111,6 +112,25 @@ pub fn browser_suppressed(cli_no_browser: bool) -> bool {
         || env_truthy("NO_BROWSER")
         || env_truthy("JCODE_NO_BROWSER")
         || running_in_test_harness()
+        || browser_unusable_here()
+}
+
+/// True when the probed environment says a browser launch cannot work.
+///
+/// Without this, jcode would open a browser that does not exist (or that opens
+/// on the wrong machine, over SSH) and then wait out a callback timeout before
+/// telling the user anything. Probing first turns a 60-second dead end into an
+/// immediate fallback to a paste/device flow.
+///
+/// Deliberately conservative: only a *positive* determination suppresses the
+/// browser, so an inconclusive probe never downgrades a working setup.
+fn browser_unusable_here() -> bool {
+    use crate::auth::env_facts::{AuthMethodChoice, EnvFacts};
+    static CHOICE: std::sync::OnceLock<AuthMethodChoice> = std::sync::OnceLock::new();
+    matches!(
+        CHOICE.get_or_init(|| EnvFacts::probe().preferred_auth_method()),
+        AuthMethodChoice::DeviceCode | AuthMethodChoice::ApiKeyNonInteractive
+    )
 }
 
 /// True when the current process is a Rust test binary (`cargo test` /
@@ -928,8 +948,11 @@ fn build_auth_status_uncached(mode: AuthProbeMode) -> (AuthStatus, Vec<(&'static
         probe_copilot_status(&mut status)
     });
     record_auth_probe_step(&mut timings, "antigravity", || {
-        status.antigravity =
-            token_state(antigravity::load_tokens().map(|tokens| tokens.is_expired()))
+        status.antigravity = refreshable_token_state(
+            "antigravity",
+            antigravity::load_tokens()
+                .map(|tokens| (tokens.is_expired(), tokens.refresh_token.clone())),
+        )
     });
     record_auth_probe_step(&mut timings, "gemini", || {
         // An official Gemini Developer API key is a static credential with no
@@ -938,7 +961,11 @@ fn build_auth_status_uncached(mode: AuthProbeMode) -> (AuthStatus, Vec<(&'static
         status.gemini = if gemini::has_api_key() {
             AuthState::Available
         } else {
-            token_state(gemini::load_tokens().map(|tokens| tokens.is_expired()))
+            refreshable_token_state(
+                "gemini",
+                gemini::load_tokens()
+                    .map(|tokens| (tokens.is_expired(), tokens.refresh_token.clone())),
+            )
         }
     });
     record_auth_probe_step(&mut timings, "cursor", || {
@@ -959,10 +986,37 @@ fn record_auth_probe_step(
     timings.push((name, step_start.elapsed().as_millis()));
 }
 
-fn token_state(result: anyhow::Result<bool>) -> AuthState {
+/// Auth state for an OAuth credential that refreshes automatically.
+///
+/// A short-lived access token is *not* a broken login. Antigravity/Gemini
+/// access tokens expire roughly hourly and the provider transparently
+/// refreshes them on the next request, so reporting `Expired` purely because
+/// the cached access token aged out makes a perfectly working provider look
+/// dead in `/login`, the header, onboarding, and `jcode auth status`.
+///
+/// Only report `Expired` when the refresh token itself is missing or was
+/// already permanently rejected (revoked / `invalid_grant`), which is the case
+/// where the user genuinely has to log in again.
+fn refreshable_token_state(provider_id: &str, result: anyhow::Result<(bool, String)>) -> AuthState {
+    refreshable_token_state_with(result, |refresh_token| {
+        crate::auth::refresh_state::refresh_token_is_known_rejected(provider_id, refresh_token)
+    })
+}
+
+/// Pure decision core of [`refreshable_token_state`], with the persisted
+/// "this refresh token was permanently rejected" lookup injected so it can be
+/// unit tested without touching `$HOME`.
+fn refreshable_token_state_with(
+    result: anyhow::Result<(bool, String)>,
+    is_known_rejected: impl Fn(&str) -> bool,
+) -> AuthState {
     match result {
-        Ok(is_expired) => {
-            if is_expired {
+        Ok((is_expired, refresh_token)) => {
+            if !is_expired {
+                return AuthState::Available;
+            }
+            let refresh_token = refresh_token.trim();
+            if refresh_token.is_empty() || is_known_rejected(refresh_token) {
                 AuthState::Expired
             } else {
                 AuthState::Available
